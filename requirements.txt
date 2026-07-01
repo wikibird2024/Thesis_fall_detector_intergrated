@@ -1,0 +1,14 @@
+# YOLOv8n + light, fast, stable
+torch==2.1.1
+torchvision==0.16.1
+torchaudio==2.1.1
+ultralytics==8.1.25
+opencv-python>=4.8
+mediapipe==0.10.21
+panoramisk==1.4.0
+python-telegram-bot>=20.0
+python-dotenv
+aiohttp
+asyncio-mqtt==0.16.2
+paho-mqtt==1.6.1
+#@:python_version=3.10.13

@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+<<<<<<< HEAD
 *.py[codz]
 *$py.class
 
@@ -153,10 +154,63 @@ venv.bak/
 
 # mkdocs documentation
 /site
+=======
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# MacOS
+.DS_Store
+
+# Logs
+*.log
+
+# Environment variables
+.env
+
+# System files
+Thumbs.db
+ehthumbs.db
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Cache files
+*.cache
+*.pkl
+*.db
+*.sqlite3
+
+# PyInstaller
+*.spec
+dist/
+build/
+
+# Unit test cache
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+>>>>>>> origin/master
 
 # mypy
 .mypy_cache/
 .dmypy.json
+<<<<<<< HEAD
 dmypy.json
 
 # Pyre type checker
@@ -205,3 +259,70 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+=======
+
+# temporary
+*.bak
+*.swp
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# MacOS
+.DS_Store
+
+# Logs
+*.log
+
+# Environment variables
+.env
+
+# System files
+Thumbs.db
+ehthumbs.db
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Cache files
+*.cache
+*.pkl
+*.db
+*.sqlite3
+
+# PyInstaller
+*.spec
+dist/
+build/
+
+# Unit test cache
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+
+# mypy
+.mypy_cache/
+.dmypy.json
+
+# temporary
+*.bak
+*.swp
+
+>>>>>>> origin/master
