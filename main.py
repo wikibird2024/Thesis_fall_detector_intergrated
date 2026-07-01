@@ -26,7 +26,8 @@ from config.config import (
     MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_TOPIC, MQTT_USERNAME, MQTT_PASSWORD, ENABLE_MQTT,
     AMI_HOST, AMI_PORT, AMI_USERNAME, AMI_SECRET, ENABLE_AMI,
     HUMAN_DETECTION_CONFIDENCE_THRESHOLD, IOU_THRESHOLD, POSE_MODEL_COMPLEXITY, POSE_MIN_DETECTION_CONFIDENCE,
-    POSE_MIN_TRACKING_CONFIDENCE, ENABLE_TELEGRAM, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+    POSE_MIN_TRACKING_CONFIDENCE, ENABLE_TELEGRAM, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    validate_config,
 )
 
 # Setup logger
@@ -64,14 +65,17 @@ async def camera_processing_loop(cap, human_detector, skeleton_tracker, person_t
                 await asyncio.sleep(0.3)
                 continue
 
-            # Detect humans
-            detected_boxes = human_detector.detect_humans(frame)
+            # Detect humans (YOLOv8 inference — run off the event loop)
+            detected_boxes = await asyncio.to_thread(human_detector.detect_humans, frame)
             tracked_people = person_tracker.update(detected_boxes)
 
-            # Track skeletons and handle detection
+            # Track skeletons and handle detection (MediaPipe inference — run off the event loop)
             for person_id, box in tracked_people:
-                landmarks = skeleton_tracker.track_from_box(frame, box)
+                landmarks = await asyncio.to_thread(skeleton_tracker.track_from_box, frame, box)
                 await detection_processor.handle_camera_data(frame, person_id, box, landmarks)
+
+            # Free memory for people no longer in frame
+            detection_processor.evict_stale_detectors()
 
             # Optional: display frame
             cv2.imshow("Fall Detection", frame)
@@ -158,6 +162,7 @@ async def main():
     tasks = []
 
     try:
+        validate_config()
         logger.info("[SYSTEM] Initializing modules...")
         human_detector = HumanDetector(
             conf_threshold=HUMAN_DETECTION_CONFIDENCE_THRESHOLD,

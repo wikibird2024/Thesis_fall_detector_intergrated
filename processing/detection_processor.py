@@ -12,6 +12,7 @@ from comm.ami_trigger import AMITrigger
 from comm.telegram_bot import TelegramBot
 from database.database_manager import insert_fall_event
 from utils.draw_utils import draw_person
+from config.config import ALERT_COOLDOWN_MINUTES
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,16 +26,17 @@ class DetectionProcessor:
     def __init__(self, ami_trigger: AMITrigger, telegram_bot: Optional[TelegramBot]):
         self.fall_detectors: Dict[str, FallDetector] = {}
         self.last_alert_timestamps: Dict[str, datetime] = {}
-        # ✅ DEDUP: Lưu timestamp sự kiện cuối cùng (dạng float) được xử lý thành công
-        self.last_fall_timestamps: Dict[str, float] = {}  
-        
+        self.last_fall_timestamps: Dict[str, float] = {}
+        self.entity_last_seen: Dict[str, datetime] = {}
+
         self.ami_trigger = ami_trigger
         self.telegram_bot = telegram_bot
-        self.cooldown_minutes = 1  # Made configurable
+        self.cooldown_minutes = ALERT_COOLDOWN_MINUTES
 
     async def handle_camera_data(self, frame: Optional[np.ndarray], person_id: int, box: list, landmarks: list):
         """Process camera frame, detect falls, and send alerts if needed."""
         entity_id = f"camera_person_{person_id}"
+        self.entity_last_seen[entity_id] = datetime.now()
         detector = self._get_or_create_detector(entity_id)
         is_fall = detector.detect_fall(landmarks)
 
@@ -95,6 +97,7 @@ class DetectionProcessor:
         if not isinstance(has_gps_fix, bool):
             has_gps_fix = False
 
+        self.entity_last_seen[device_id] = datetime.now()
         logger.info(f"[MQTT] ✅ Parsed: device_id={device_id}, fall_detected={fall_detected}, ts={event_ts}")
 
         # ✅ DEDUP: Sử dụng timestamp của event_ts từ thiết bị để check lặp
@@ -251,6 +254,20 @@ class DetectionProcessor:
             logger.debug(f"[COOLDOWN] Blocking alert for {entity_id}: Cooldown active.")
         
         return is_cooldown_expired
+
+    def evict_stale_detectors(self, max_age_seconds: float = 30.0):
+        """Remove state for entities not seen within max_age_seconds."""
+        now = datetime.now()
+        stale = [
+            eid for eid, last in self.entity_last_seen.items()
+            if (now - last).total_seconds() > max_age_seconds
+        ]
+        for eid in stale:
+            self.fall_detectors.pop(eid, None)
+            self.last_alert_timestamps.pop(eid, None)
+            self.last_fall_timestamps.pop(eid, None)
+            self.entity_last_seen.pop(eid, None)
+            logger.debug(f"[EVICT] Evicted stale entity: {eid}")
 
     def _update_last_alert(self, entity_id: str):
         """Update last alert timestamp."""

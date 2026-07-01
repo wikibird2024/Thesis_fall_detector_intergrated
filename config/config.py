@@ -1,7 +1,6 @@
 
 import os
 from dotenv import load_dotenv
-# Load environment variables from .env
 load_dotenv()
 
 # ==============================
@@ -105,3 +104,33 @@ CALLER_ID = "FallAlertSystem <1000>"
 # ==============================
 AMI_API_ENDPOINT = "http://your-ami-api-endpoint"
 AMI_API_KEY = os.getenv("AMI_API_KEY")        # bí mật -> .env
+
+# ==============================
+# Alert cooldown
+# ==============================
+ALERT_COOLDOWN_MINUTES: int = 1
+
+
+def validate_config():
+    """Raise EnvironmentError at startup if required secrets are missing for enabled features."""
+    errors = []
+    if ENABLE_MQTT:
+        if not MQTT_USERNAME:
+            errors.append("MQTT_USERNAME required when ENABLE_MQTT=True")
+        if not MQTT_PASSWORD:
+            errors.append("MQTT_PASSWORD required when ENABLE_MQTT=True")
+    if ENABLE_TELEGRAM:
+        if not TELEGRAM_BOT_TOKEN:
+            errors.append("TELEGRAM_BOT_TOKEN required when ENABLE_TELEGRAM=True")
+        if not TELEGRAM_CHAT_ID:
+            errors.append("TELEGRAM_CHAT_ID required when ENABLE_TELEGRAM=True")
+    if ENABLE_AMI:
+        if not AMI_USERNAME:
+            errors.append("AMI_USERNAME required when ENABLE_AMI=True")
+        if not AMI_SECRET:
+            errors.append("AMI_SECRET required when ENABLE_AMI=True")
+    if errors:
+        raise EnvironmentError(
+            "Missing required environment variables:\n" +
+            "\n".join(f"  - {e}" for e in errors)
+        )

@@ -6,4 +6,4 @@ from fall.fall_detector import FallDetector
 
 def test_no_fall():
     detector = FallDetector()
-    assert detector.is_fall([]) == False
+    assert detector.detect_fall([]) == False
