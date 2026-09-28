@@ -43,7 +43,7 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5",
-    "ruff>=0.6",
+    "ruff>=0.16,<0.17",            # same version as .pre-commit-config.yaml
     "mypy>=1.10",
     "pre-commit>=3.7",
     "types-requests",

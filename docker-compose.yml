@@ -1,0 +1,39 @@
+# Local stack.
+#   docker compose up -d                          # app only
+#   docker compose --profile local-broker up -d   # + Mosquitto MQTT broker for offline testing
+#   docker compose --profile monitoring up -d     # + Prometheus at http://localhost:9090
+services:
+  fall-detector:
+    build: .
+    image: fall-detector:local
+    env_file: .env
+    ports:
+      - "8080:8080"             # health + metrics
+    volumes:
+      - fall-data:/app/data     # SQLite database survives container rebuilds
+    # Webcam passthrough (Linux). Remove if you only use the ESP32 stream.
+    # devices:
+    #   - /dev/video0:/dev/video0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach Asterisk on the host: AMI__HOST=host.docker.internal
+    restart: unless-stopped
+    stop_grace_period: 30s      # time to deliver queued alerts on shutdown
+
+  mosquitto:
+    profiles: ["local-broker"]
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./ops/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  prometheus:
+    profiles: ["monitoring"]
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+volumes:
+  fall-data:

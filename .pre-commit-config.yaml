@@ -14,9 +14,9 @@ repos:
       - id: check-merge-conflict      # the old .gitignore once had conflict markers
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.6.9
+    rev: v0.16.9   # keep equal to the ruff version in pyproject.toml [dev]
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: ["--fix"]
       - id: ruff-format
 

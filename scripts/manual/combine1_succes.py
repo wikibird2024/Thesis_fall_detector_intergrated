@@ -55,26 +55,26 @@ async def alert_extension(manager, extension):
 async def main():
     # Create manager instance
     manager = Manager(**MANAGER_CONFIG)
-    
+
     try:
         # Connect to AMI
         print("🔌 Connecting to Asterisk AMI...")
         await manager.connect()
         print("✅ Connected successfully!")
-        
+
         # Send alerts to all extensions simultaneously
         print(f"🚨 Sending fall alerts to {len(endpoints)} extensions...")
         await asyncio.gather(*[
             alert_extension(manager, ext) for ext in endpoints
         ])
-        
+
         # Wait a bit to ensure all actions complete
         print("⏳ Waiting for actions to complete...")
         await asyncio.sleep(5)
-        
+
     except Exception as e:
         print(f"❌ Error in main execution: {e}")
-    
+
     finally:
         # Close the connection
         print("🔌 Closing AMI connection...")

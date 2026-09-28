@@ -3,6 +3,7 @@
     fall-detector                 run the system (same as `fall-detector run`)
     fall-detector check-config    validate settings and print them (secrets hidden)
     fall-detector events -n 20    show the latest fall events from the database
+    fall-detector config-docs     print docs/CONFIGURATION.md (generated from settings.py)
 
 Also: `python -m fall_detector ...` or `python main.py ...`.
 Exit codes: 0 ok, 2 invalid configuration.
@@ -40,6 +41,7 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     commands.add_parser("check-config", help="validate settings and print them")
     events = commands.add_parser("events", help="show recent fall events")
     events.add_argument("-n", "--limit", type=int, default=20)
+    commands.add_parser("config-docs", help="print the configuration reference (Markdown)")
     return parser.parse_args(argv)
 
 
@@ -86,6 +88,11 @@ def cmd_events(settings: Settings, limit: int) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.command == "config-docs":  # needs no settings, so it works without a .env
+        from fall_detector.config_docs import render_configuration_markdown
+
+        print(render_configuration_markdown(), end="")
+        return EXIT_OK
     configure_logging()  # defaults until settings are known
     try:
         settings = load_settings(args.env_file)

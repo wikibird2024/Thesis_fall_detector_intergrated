@@ -64,3 +64,15 @@ def test_configure_logging_quiets_noisy_libraries():
     configure_logging("DEBUG")
     assert logging.getLogger("httpx").level == logging.WARNING
     assert logging.getLogger().level == logging.DEBUG
+
+
+def test_configuration_doc_is_up_to_date():
+    """Fails when settings.py changed but docs/CONFIGURATION.md was not regenerated."""
+    from pathlib import Path
+
+    from fall_detector.config_docs import render_configuration_markdown
+
+    doc = Path(__file__).resolve().parents[2] / "docs" / "CONFIGURATION.md"
+    assert doc.read_text() == render_configuration_markdown(), (
+        "run: fall-detector config-docs > docs/CONFIGURATION.md"
+    )

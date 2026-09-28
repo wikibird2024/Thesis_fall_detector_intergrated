@@ -3,7 +3,7 @@ import telnetlib
 HOST = "127.0.0.1"
 PORT = 5038
 USERNAME = "hx"
-PASSWORD = "123"  
+PASSWORD = "123"
 
 FROM = "6001"
 TO = "6002"
@@ -30,4 +30,3 @@ tn.write(b"Action: Logoff\n\n")
 
 # Output
 print(tn.read_all().decode())
-

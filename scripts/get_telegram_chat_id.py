@@ -1,52 +1,49 @@
+"""Print the chat id of the last person who messaged your bot.
 
-# get_chat_id.py
-import os
+1. Put TELEGRAM__BOT_TOKEN in .env
+2. Send /start to your bot in Telegram
+3. python scripts/get_telegram_chat_id.py
+4. Copy the printed id to TELEGRAM__CHAT_ID in .env
+"""
+
 import asyncio
-from telegram import Bot
+import contextlib
+import os
+import sys
+from pathlib import Path
+
 from dotenv import load_dotenv
+from telegram import Bot
+from telegram.error import TelegramError
 
-# -----------------------------
-# Load token từ file .env
-# -----------------------------
-load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+from fall_detector.settings import apply_legacy_env_names
 
-if not TOKEN:
-    raise ValueError("Bạn chưa đặt TELEGRAM_BOT_TOKEN trong file .env")
 
-# -----------------------------
-# Async function chính
-# -----------------------------
-async def main():
-    bot = Bot(token=TOKEN)
+async def main() -> int:
+    apply_legacy_env_names(Path(".env"))  # old TELEGRAM_BOT_TOKEN name still works
+    load_dotenv()
+    token = os.environ.get("TELEGRAM__BOT_TOKEN")
+    if not token:
+        print("TELEGRAM__BOT_TOKEN is not set in .env")
+        return 1
 
+    bot = Bot(token=token)
     try:
-        # Lấy tất cả updates chưa đọc (không chờ timeout dài)
         updates = await bot.get_updates(offset=-1)
-
-        if not updates:
-            print("Chưa có tin nhắn nào gửi tới bot. Hãy nhắn /start cho bot trước khi chạy script.")
-            return
-
-        latest_message = updates[-1].message
-        chat_id = latest_message.chat.id
-        username = latest_message.chat.username or "Không có username"
-
-        print(f"Chat ID của bạn: {chat_id}")
-        print(f"Username Telegram: {username}")
-
-    except Exception as e:
-        print("Lỗi khi lấy chat ID:", e)
-
+        if not updates or not updates[-1].effective_chat:
+            print("No messages yet. Send /start to the bot, then run this again.")
+            return 1
+        chat = updates[-1].effective_chat
+        print(f"Chat id:  {chat.id}")
+        print(f"Username: {chat.username or '-'}")
+        return 0
+    except TelegramError as error:
+        print(f"Telegram error: {error}")
+        return 1
     finally:
-        # Đóng bot an toàn
-        try:
-            await bot.close()
-        except:
-            pass  # Nếu bị flood control thì bỏ qua
+        with contextlib.suppress(TelegramError):  # flood control on close is harmless here
+            await bot.shutdown()
 
-# -----------------------------
-# Chạy script
-# -----------------------------
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))

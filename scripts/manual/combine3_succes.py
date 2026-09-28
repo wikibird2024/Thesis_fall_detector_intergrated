@@ -9,7 +9,7 @@ AMI_SECRET = '123'
 
 # === Fall Alert Settings ===
 # 🔑 ĐÃ THÊM 6004 VÀO DANH SÁCH CẦN TEST
-EXTENSIONS = ['6001', '6002', '6003', '6004'] 
+EXTENSIONS = ['6001', '6002', '6003', '6004']
 ALERT_MESSAGE = "⚠️ Cảnh báo: Phát hiện ngã tại vị trí hiện tại!"
 CALLER_ID = "FallAlert"
 
@@ -50,7 +50,7 @@ async def send_message(ext: str):
             'Action': 'MessageSend',
             'To': f'pjsip:{ext}',
             # URI SIP hợp lệ, khớp với logic đã sửa trong extensions.ael
-            'From': 'sip:alert-system@127.0.0.1', 
+            'From': 'sip:alert-system@127.0.0.1',
             'Body': ALERT_MESSAGE
         })
         print(f"[📨 SMS] → {ext} | Status: {response.get('Response')} - {response.get('Message')}")
