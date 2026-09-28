@@ -6,6 +6,12 @@ For every configured extension, at the same time:
   - MessageSend: SIP text message with the alert.
 
 The alert counts as delivered if at least one extension got a call or a message.
+
+Reconnecting is left to panoramisk: after a failed connect or a lost
+connection it tries again every `reconnect_timeout` (2 s) on its own. We
+connect once in start() and never call connect() again: a second connect()
+replaces the live connection, which panoramisk sees as "lost" and reconnects,
+closing ours in turn, and so on every 2 s (version 1 had that loop).
 """
 
 from __future__ import annotations
@@ -65,29 +71,25 @@ class AMITrigger:
         self.hangup_extension = hangup_extension
         self.cleanup_delay_s = cleanup_delay_s
         self._manager = manager_factory(host=host, port=port, username=username, secret=secret)
-        self.is_connected = False
-        self._connect_lock = asyncio.Lock()
+
+    @property
+    def is_connected(self) -> bool:
+        # panoramisk has no public flag; `_connected` follows connection_made / connection_lost.
+        return bool(getattr(self._manager, "_connected", False))
 
     async def start(self) -> None:
+        logger.info("Connecting to Asterisk AMI at %s:%s", self.host, self.port)
         try:
-            await self._connect()
-        except Exception as error:
-            logger.warning("Asterisk AMI not reachable at startup (%r); will retry on first alert", error)
-
-    async def _connect(self) -> None:
-        async with self._connect_lock:  # two alerts at once must not open two connections
-            if self.is_connected:
-                return
-            logger.info("Connecting to Asterisk AMI at %s:%s", self.host, self.port)
             await self._manager.connect()
-            self.is_connected = True
             logger.info("Asterisk AMI connected")
+        except Exception as error:
+            logger.warning(
+                "Asterisk AMI not reachable (%r); panoramisk keeps retrying in the background", error
+            )
 
     async def send(self, alert: Alert) -> None:
-        try:
-            await self._connect()
-        except Exception as error:
-            raise AlertDeliveryError(f"AMI connect failed: {error!r}") from error
+        if getattr(self._manager, "protocol", None) is None or not self.is_connected:
+            raise AlertDeliveryError("AMI not connected (reconnect in progress)")
 
         results = await asyncio.gather(
             *(self._alert_extension(ext, alert.message) for ext in self.extensions)
@@ -139,7 +141,6 @@ class AMITrigger:
             response = await self._manager.send_action(action)
         except Exception as error:
             logger.error("Asterisk %s failed: %r", description, error)
-            self.is_connected = False  # reconnect on next alert
             return False
         ok = is_success(response)
         log = logger.info if ok else logger.warning
@@ -147,7 +148,5 @@ class AMITrigger:
         return ok
 
     async def close(self) -> None:
-        if self.is_connected:
-            self._manager.close()
-            self.is_connected = False
-            logger.info("Asterisk AMI disconnected")
+        self._manager.close()
+        logger.info("Asterisk AMI disconnected")

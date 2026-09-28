@@ -63,7 +63,7 @@ through every system.
 | Any background task crashes | Logged with stack trace, restarted with backoff, `task_restarts_total` +1 | `supervisor.py` |
 | Telegram slow / down | Retried with backoff (honors flood-control wait); other channels unaffected | `dispatcher.py` |
 | Photo upload fails | Falls back to text | `telegram_bot.py` |
-| Asterisk unreachable | Reconnect on next alert; fails only if no extension reached | `ami_trigger.py` |
+| Asterisk unreachable | panoramisk reconnects every 2 s by itself; an alert in the gap fails fast and the dispatcher retries it | `ami_trigger.py` |
 | Database locked / disk full | Alert still sent; error logged; `db_writes_total{outcome="failed"}` | `dispatcher.py` |
 | Alert queue full (100) | Alert dropped, logged at ERROR, `alerts_dropped_total` +1 | `dispatcher.py` |
 | Bad MQTT payload | Rejected and logged; bad GPS only → alert with "location unknown" | `mqtt_client.py` |

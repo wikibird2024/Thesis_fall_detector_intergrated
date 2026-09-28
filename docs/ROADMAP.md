@@ -41,6 +41,7 @@ Phase 0 Foundation ─> 1 Safety net ─> 2 Correctness ─> 3 Architecture ─>
 | Stale-entity eviction (30 s) shorter than cooldown (60 s) | Repeat alerts from the same device | Phase 3 |
 | Multi-line alert text in AMI headers | Would corrupt the AMI action | Phase 3 |
 | Config errors echoed input values | Could print passwords into logs | Phase 3 |
+| AMI `connect()` called again after an error while panoramisk also reconnected | Connections replaced each other every 2 s | Phase 5 review |
 | `requirements.txt` listed the wrong MQTT library, missed pandas | Fresh install failed | Phase 0 |
 
 ## Next: Phase 6, scale and accuracy

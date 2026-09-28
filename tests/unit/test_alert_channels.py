@@ -83,16 +83,22 @@ async def test_telegram_start_sends_startup_message():
 
 
 class FakeManager:
+    """Mimics panoramisk.Manager: `protocol` and `_connected` are set on a successful connect."""
+
     def __init__(self, connect_error=None, replies=None, **kwargs):
         self.connect_error = connect_error
         self.replies = replies or {}  # (action, extension) -> reply
         self.actions = []
         self.connects = 0
+        self.protocol = None
+        self._connected = False
+        self.closed = False
 
     async def connect(self):
         self.connects += 1
         if self.connect_error:
             raise self.connect_error
+        self.protocol, self._connected = object(), True
 
     async def send_action(self, action):
         self.actions.append(action)
@@ -103,11 +109,12 @@ class FakeManager:
         return reply
 
     def close(self):
-        pass
+        self.closed = True
 
 
-def asterisk(manager, extensions=("6001", "6002")) -> AMITrigger:
-    return AMITrigger(
+async def asterisk(manager, extensions=("6001", "6002")) -> AMITrigger:
+    """AMITrigger around a fake manager, already started (as the app does)."""
+    trigger = AMITrigger(
         "127.0.0.1",
         5038,
         "user",
@@ -117,11 +124,13 @@ def asterisk(manager, extensions=("6001", "6002")) -> AMITrigger:
         cleanup_delay_s=0,
         manager_factory=lambda **kw: manager,
     )
+    await trigger.start()
+    return trigger
 
 
 async def test_asterisk_calls_and_messages_every_extension():
     manager = FakeManager()
-    await asterisk(manager).send(Alert(EVENT))
+    await (await asterisk(manager)).send(Alert(EVENT))
     kinds = sorted((a["Action"], a.get("Channel") or a["To"]) for a in manager.actions)
     assert kinds == [
         ("MessageSend", "pjsip:6001"),
@@ -134,35 +143,48 @@ async def test_asterisk_calls_and_messages_every_extension():
 async def test_asterisk_text_is_single_line():
     # AMI header values end at a line break; multi-line text would corrupt the action.
     manager = FakeManager()
-    await asterisk(manager).send(Alert(EVENT))
+    await (await asterisk(manager)).send(Alert(EVENT))
     assert all("\n" not in str(value) for action in manager.actions for value in action.values())
 
 
 async def test_asterisk_partial_failure_still_counts_as_delivered():
     failure = {"Response": "Error"}
     manager = FakeManager(replies={("Originate", "6001"): failure, ("MessageSend", "6001"): failure})
-    await asterisk(manager).send(Alert(EVENT))  # 6002 reached: no exception
+    await (await asterisk(manager)).send(Alert(EVENT))  # 6002 reached: no exception
 
 
 async def test_asterisk_raises_when_no_extension_reached():
     failure = {"Response": "Error"}
     replies = {(kind, ext): failure for kind in ("Originate", "MessageSend") for ext in ("6001", "6002")}
     with pytest.raises(AlertDeliveryError):
-        await asterisk(FakeManager(replies=replies)).send(Alert(EVENT))
+        await (await asterisk(FakeManager(replies=replies))).send(Alert(EVENT))
 
 
-async def test_asterisk_raises_when_cannot_connect():
-    with pytest.raises(AlertDeliveryError):
-        await asterisk(FakeManager(connect_error=ConnectionRefusedError())).send(Alert(EVENT))
-
-
-async def test_asterisk_reconnects_after_action_error():
-    manager = FakeManager(replies={("Originate", "6001"): ConnectionResetError()})
-    trigger = asterisk(manager, extensions=["6001"])
-    await trigger.send(Alert(EVENT))  # message still succeeded
+async def test_asterisk_start_survives_unreachable_server():
+    trigger = await asterisk(FakeManager(connect_error=ConnectionRefusedError()))
     assert not trigger.is_connected
+
+
+async def test_asterisk_send_fails_fast_while_not_connected():
+    trigger = await asterisk(FakeManager(connect_error=ConnectionRefusedError()))
+    with pytest.raises(AlertDeliveryError):
+        await trigger.send(Alert(EVENT))
+
+
+async def test_asterisk_never_opens_a_second_connection():
+    # Regression: calling connect() again replaced the live connection, which
+    # panoramisk treated as lost and reconnected: a loop every 2 seconds.
+    manager = FakeManager(replies={("Originate", "6001"): ConnectionResetError()})
+    trigger = await asterisk(manager, extensions=["6001"])
+    await trigger.send(Alert(EVENT))  # SIP message still succeeded
     await trigger.send(Alert(EVENT))
-    assert manager.connects == 2
+    assert manager.connects == 1
+
+
+async def test_asterisk_close_closes_manager():
+    manager = FakeManager()
+    await (await asterisk(manager)).close()
+    assert manager.closed
 
 
 @pytest.mark.parametrize(
