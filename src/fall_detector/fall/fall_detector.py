@@ -25,8 +25,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-# MediaPipe Pose landmark: [x, y, z, visibility]. z is depth, not confidence.
-Landmark = Sequence[float]
+from fall_detector.domain import Landmark
 
 LEFT_SHOULDER = 11
 RIGHT_SHOULDER = 12

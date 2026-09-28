@@ -1,10 +1,22 @@
-# skeleton_tracker.py
+"""Pose landmarks for one person with MediaPipe Pose."""
+
+from __future__ import annotations
+
 import cv2
-import mediapipe as mp
+import numpy as np
+
+from fall_detector.domain import Box, Landmark
 
 
 class SkeletonTracker:
-    def __init__(self, model_complexity=1, min_detection_confidence=0.5, min_tracking_confidence=0.5):
+    def __init__(
+        self,
+        model_complexity: int = 1,
+        min_detection_confidence: float = 0.5,
+        min_tracking_confidence: float = 0.5,
+    ) -> None:
+        import mediapipe as mp  # heavy import, only when pose is really needed
+
         self.pose = mp.solutions.pose.Pose(
             static_image_mode=False,
             model_complexity=model_complexity,
@@ -12,46 +24,35 @@ class SkeletonTracker:
             min_tracking_confidence=min_tracking_confidence,
         )
 
-    def track_from_box(self, frame, box):
+    def track_from_box(self, frame: np.ndarray, box: Box) -> list[Landmark]:
+        """Landmarks [x, y, z, visibility] in frame pixels, or [] if no pose found.
+
+        The crop is made square around the box to avoid MediaPipe NORM_RECT warnings.
         """
-        Track skeleton landmarks within a bounding box.
-        ROI is normalized to a square to avoid Mediapipe NORM_RECT warnings.
-        Returns landmarks in frame coordinates: [x, y, z, visibility]
-        """
-        x1, y1, x2, y2 = map(int, box[:4])
+        x1, y1, x2, y2 = (int(v) for v in box[:4])
         if x2 <= x1 or y2 <= y1:
             return []
 
-        # Make ROI square
         width, height = x2 - x1, y2 - y1
-        size = max(width, height)
+        half_size = max(width, height) // 2
         center_x, center_y = x1 + width // 2, y1 + height // 2
-        half_size = size // 2
+        left = max(center_x - half_size, 0)
+        top = max(center_y - half_size, 0)
+        right = min(center_x + half_size, frame.shape[1])
+        bottom = min(center_y + half_size, frame.shape[0])
 
-        x1_s = max(center_x - half_size, 0)
-        y1_s = max(center_y - half_size, 0)
-        x2_s = min(center_x + half_size, frame.shape[1])
-        y2_s = min(center_y + half_size, frame.shape[0])
-
-        crop = frame[y1_s:y2_s, x1_s:x2_s]
+        crop = frame[top:bottom, left:right]
         if crop.size == 0:
             return []
-
-        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-        results = self.pose.process(crop_rgb)
+        results = self.pose.process(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
         if not results.pose_landmarks:
             return []
 
-        # Map landmarks back to original frame coordinates
-        landmarks = []
-        for lm in results.pose_landmarks.landmark:
-            lx = int(lm.x * (x2_s - x1_s)) + x1_s
-            ly = int(lm.y * (y2_s - y1_s)) + y1_s
-            lz = lm.z
-            visibility = lm.visibility
-            landmarks.append([lx, ly, lz, visibility])
+        crop_w, crop_h = right - left, bottom - top
+        return [
+            [int(lm.x * crop_w) + left, int(lm.y * crop_h) + top, lm.z, lm.visibility]
+            for lm in results.pose_landmarks.landmark
+        ]
 
-        return landmarks
-
-    def close(self):
+    def close(self) -> None:
         self.pose.close()

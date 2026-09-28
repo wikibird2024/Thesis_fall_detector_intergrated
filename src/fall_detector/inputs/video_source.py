@@ -1,71 +1,61 @@
-"""
-Features:
-- Robust parsing of MJPEG stream (chunked JPEG handling)
-- Persistent HTTP session (requests.Session)
-- Auto reconnect with exponential backoff
-- Buffer overflow protection
-- Alive watchdog
-- mDNS resolution + IP fallback
-- Project-level config integration
-- Compatible with legacy main.py
+"""Video sources: ESP32-CAM MJPEG over HTTP, or a local webcam/file via OpenCV.
 
-Usage:
-    from esp32_stream import find_and_connect_source
-    cap = find_and_connect_source()
+Both expose the same two methods (the VideoSource protocol), so the camera
+pipeline does not care which one it has:
+
+    read()    -> (True, frame) or (False, None)
+    release() -> close it
+
+The ESP32 wrapper reconnects by itself when no frame arrived for
+`alive_timeout` seconds. All calls block; the pipeline runs them in a thread.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import socket
 import time
+from collections.abc import Iterator, Sequence
+from typing import Protocol
 from urllib.parse import urlparse
 
 import cv2
 import numpy as np
 import requests
 
-from fall_detector import settings as config  # ✅ project-level configuration
+logger = logging.getLogger(__name__)
 
-# ---------------- Logger ----------------
-logger = logging.getLogger("esp32_stream")
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    logger.addHandler(handler)
-logger.setLevel(logging.INFO)
-
-# ---------------- Constants ----------------
 JPEG_START = b"\xff\xd8"
 JPEG_END = b"\xff\xd9"
 
 
-# ---------------- Exceptions ----------------
+class VideoSource(Protocol):
+    def read(self) -> tuple[bool, np.ndarray | None]: ...
+
+    def release(self) -> None: ...
+
+
 class StreamError(Exception):
     pass
 
 
-# ---------------- Utility: mDNS/IP resolution ----------------
 def resolve_mdns_or_ip(url: str) -> str:
-    """Resolve mDNS (.local) hostname to IP address if needed."""
+    """Replace a `.local` (mDNS) host name with its IP; some HTTP stacks can't resolve it."""
+    host = urlparse(url).hostname
+    if not host or not host.endswith(".local"):
+        return url
     try:
-        parsed = urlparse(url)
-        host = parsed.hostname
-        if host and host.endswith(".local"):
-            logger.info(f"[mDNS] Resolving {host}...")
-            ip = socket.gethostbyname(host)
-            new_url = url.replace(host, ip)
-            logger.info(f"[mDNS] Resolved {host} → {ip}")
-            return new_url
+        ip = socket.gethostbyname(host)
+    except OSError as error:
+        logger.warning("Could not resolve %s: %s", host, error)
         return url
-    except Exception as e:
-        logger.warning(f"[mDNS] Failed to resolve {url}: {e}")
-        return url
+    logger.info("Resolved %s -> %s", host, ip)
+    return url.replace(host, ip)
 
 
-# ---------------- Core Wrapper ----------------
 class ESP32StreamWrapper:
-    """Wrapper for ESP32-CAM MJPEG HTTP stream."""
+    """Reads JPEG frames from an ESP32-CAM MJPEG (multipart) HTTP stream."""
 
     def __init__(
         self,
@@ -76,204 +66,130 @@ class ESP32StreamWrapper:
         max_buffer: int = 2 * 1024 * 1024,
         reconnect_backoff_base: float = 0.5,
         reconnect_backoff_max: float = 8.0,
-    ):
+    ) -> None:
         self.url = resolve_mdns_or_ip(url)
-        self.alive_timeout = float(alive_timeout)
-        self.connect_timeout = float(connect_timeout)
-        self.read_chunk_size = int(read_chunk_size)
-        self.max_buffer = int(max_buffer)
-        self._backoff_base = float(reconnect_backoff_base)
-        self._backoff_max = float(reconnect_backoff_max)
+        if urlparse(self.url).scheme not in ("http", "https"):
+            raise ValueError(f"Unsupported URL scheme: {self.url}")
+        self.alive_timeout = alive_timeout
+        self.connect_timeout = connect_timeout
+        self.read_chunk_size = read_chunk_size
+        self.max_buffer = max_buffer
+        self._backoff_base = reconnect_backoff_base
+        self._backoff_max = reconnect_backoff_max
 
         self.session: requests.Session | None = None
         self.response: requests.Response | None = None
-        self._iter = None
-        self.bytes_buffer = b""
+        self._chunks: Iterator[bytes] | None = None
+        self.buffer = b""
         self.last_frame_time = 0.0
-        self._connected_at = 0.0
         self._connect_attempts = 0
-
-        parsed = urlparse(self.url)
-        if parsed.scheme not in ("http", "https"):
-            raise ValueError(f"Unsupported URL scheme: {parsed.scheme}")
 
         if not self.connect():
             raise StreamError(f"Failed to connect to ESP32 stream: {self.url}")
 
-    # ---------------- Connection ----------------
-    def _make_session(self) -> requests.Session:
-        s = requests.Session()
-        s.headers.update(
-            {
-                "User-Agent": "esp32-mjpeg-client/1.1",
-                "Accept": "multipart/x-mixed-replace, image/jpeg, */*",
-                "Connection": "keep-alive",
-            }
-        )
-        return s
-
     def connect(self) -> bool:
         self._connect_attempts += 1
-        backoff = min(self._backoff_base * (2 ** (self._connect_attempts - 1)), self._backoff_max)
-
         if self.session is None:
-            self.session = self._make_session()
-        if self.response is not None:
-            try:
-                self.response.close()
-            except Exception:
-                pass
-
+            self.session = requests.Session()
+            self.session.headers.update(
+                {"User-Agent": "fall-detector/2", "Accept": "multipart/x-mixed-replace, image/jpeg, */*"}
+            )
+        self._close_response()
         try:
-            logger.info(f"[ESP32] Connecting to {self.url} (attempt {self._connect_attempts})")
+            logger.info("Connecting to ESP32 stream %s (attempt %d)", self.url, self._connect_attempts)
             self.response = self.session.get(self.url, stream=True, timeout=self.connect_timeout)
             self.response.raise_for_status()
-            ctype = self.response.headers.get("Content-Type", "")
-            if "multipart" not in ctype and "jpeg" not in ctype:
-                logger.warning(f"[ESP32] Unexpected Content-Type: {ctype}")
-
-            self._iter = self.response.iter_content(chunk_size=self.read_chunk_size)
-            self.bytes_buffer = b""
-            self.last_frame_time = time.time()
-            self._connected_at = time.time()
+            content_type = self.response.headers.get("Content-Type", "")
+            if "multipart" not in content_type and "jpeg" not in content_type:
+                logger.warning("Unexpected Content-Type from ESP32: %s", content_type)
+            self._chunks = self.response.iter_content(chunk_size=self.read_chunk_size)
+            self.buffer = b""
+            self.last_frame_time = time.monotonic()
             self._connect_attempts = 0
-            logger.info(f"[ESP32] Connected successfully to {self.url}")
+            logger.info("ESP32 stream connected")
             return True
-        except requests.RequestException as e:
-            logger.error(f"[ESP32] Connection failed: {e}. Backoff {backoff:.1f}s")
+        except requests.RequestException as error:
+            backoff = min(self._backoff_base * 2 ** (self._connect_attempts - 1), self._backoff_max)
+            logger.error("ESP32 connection failed: %s; waiting %.1fs", error, backoff)
             time.sleep(backoff)
             return False
 
-    def release(self):
-        if self.response:
-            try:
-                self.response.close()
-            except Exception:
-                pass
-        if self.session:
-            try:
-                self.session.close()
-            except Exception:
-                pass
-        self._iter = None
-        self.response = None
-        self.session = None
-        self.bytes_buffer = b""
-        logger.info(f"[ESP32] Stream released: {self.url}")
-
-    # ---------------- Reading ----------------
     def is_alive(self) -> bool:
-        return (time.time() - self.last_frame_time) < self.alive_timeout
+        return (time.monotonic() - self.last_frame_time) < self.alive_timeout
 
     def read(self) -> tuple[bool, np.ndarray | None]:
-        # Nâng cấp log từ debug lên info để dễ theo dõi sự kiện reconnect quan trọng
-        if not self.is_alive():
-            logger.info("[ESP32] Alive timeout expired; attempting reconnect.")
-            self.connect()
+        """Read chunks until one full JPEG is decoded, or give up after alive_timeout.
 
-        if self._iter is None and self.response:
-            self._iter = self.response.iter_content(chunk_size=self.read_chunk_size)
+        Before: one call read ONE 8 KB chunk; a frame is 20-50 KB, so most calls
+        returned "no frame" and the caller slept 0.3 s each time (about 1 fps).
+        """
+        if not self.is_alive():
+            logger.info("No ESP32 frame for %.0fs; reconnecting", self.alive_timeout)
+            self.connect()
+        if self._chunks is None:
+            return False, None
 
         try:
-            chunk = next(self._iter, None)
-
-            # REFACTOR: Loại bỏ self.connect() khi không có chunk để tránh spam log.
-            # Logic Alive Watchdog sẽ xử lý việc reconnect sau timeout (10s).
-            if not chunk:
-                return False, None
-
-            self.bytes_buffer += chunk
-            if len(self.bytes_buffer) > self.max_buffer:
-                self.bytes_buffer = b""
-                logger.warning("[ESP32] Buffer overflow, resetting buffer.")
-
-            start = self.bytes_buffer.find(JPEG_START)
-            end = self.bytes_buffer.find(JPEG_END)
-            if start != -1 and end != -1 and end > start:
-                jpg = self.bytes_buffer[start : end + 2]
-                self.bytes_buffer = self.bytes_buffer[end + 2 :]
-                arr = np.frombuffer(jpg, np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if img is not None:
-                    self.last_frame_time = time.time()
-                    return True, img
-        except Exception as e:
-            # Vẫn gọi connect() khi có ngoại lệ thực sự xảy ra trong quá trình đọc
-            logger.warning(f"[ESP32] Stream read error: {e}")
+            while self.is_alive():
+                frame = self._next_frame_from_buffer()
+                if frame is not None:
+                    self.last_frame_time = time.monotonic()
+                    return True, frame
+                chunk = next(self._chunks, None)
+                if not chunk:
+                    return False, None  # stream ended; watchdog reconnects next call
+                self.buffer += chunk
+                if len(self.buffer) > self.max_buffer:
+                    logger.warning("ESP32 buffer overflow; dropping %d bytes", len(self.buffer))
+                    self.buffer = b""
+        except (requests.RequestException, OSError) as error:
+            logger.warning("ESP32 stream read error: %s", error)
             self.connect()
         return False, None
 
-    # ---------------- Context Manager ----------------
-    def __enter__(self) -> ESP32StreamWrapper:
-        return self
+    def _next_frame_from_buffer(self) -> np.ndarray | None:
+        start = self.buffer.find(JPEG_START)
+        end = self.buffer.find(JPEG_END, start + 2) if start != -1 else -1
+        if start == -1 or end == -1:
+            return None
+        jpeg = self.buffer[start : end + 2]
+        self.buffer = self.buffer[end + 2 :]
+        return cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.release()
+    def _close_response(self) -> None:
+        if self.response is not None:
+            with contextlib.suppress(Exception):
+                self.response.close()
+        self.response = None
+        self._chunks = None
+
+    def release(self) -> None:
+        self._close_response()
+        if self.session is not None:
+            with contextlib.suppress(Exception):
+                self.session.close()
+        self.session = None
+        self.buffer = b""
+        logger.info("ESP32 stream released: %s", self.url)
 
 
-# ---------------- Helpers ----------------
-def get_config_sources() -> list[str | int]:
-    """Load video sources from config.py instead of .env."""
-    sources: list[str | int] = []
-    stream = getattr(config, "VIDEO_STREAM_URL", None)
-    webcam = getattr(config, "VIDEO_WEBCAM_INDEX", None)
-    if stream:
-        sources.append(stream)
-    if webcam is not None:
-        sources.append(int(webcam))
-    if not sources:
-        sources.append(0)
-    return sources
+def find_and_connect_source(sources: Sequence[str | int]) -> VideoSource | None:
+    """Open the first source that works, in priority order.
 
-
-def find_and_connect_source(
-    priority_sources: list[str | int] | None = None,
-) -> ESP32StreamWrapper | cv2.VideoCapture | None:
+    http(s) URL -> ESP32StreamWrapper;  int or file path -> cv2.VideoCapture.
     """
-    Try all sources in priority order:
-    - HTTP/mDNS URL → ESP32StreamWrapper
-    - Webcam index or file → cv2.VideoCapture
-    """
-    sources = priority_sources or get_config_sources()
-    for src in sources:
-        logger.info(f"[VIDEO] Trying source: {src}")
-        if isinstance(src, str) and src.startswith("http"):
+    for source in sources:
+        logger.info("Trying video source %s", source)
+        if isinstance(source, str) and source.startswith("http"):
             try:
-                wrapper = ESP32StreamWrapper(src)
-                return wrapper
-            except Exception as e:
-                logger.error(f"[VIDEO] ESP32 stream failed: {e}")
-        else:
-            try:
-                cap = cv2.VideoCapture(src)
-                if cap.isOpened():
-                    logger.info(f"[VIDEO] Opened local camera: {src}")
-                    return cap
-                cap.release()
-            except Exception as e:
-                logger.error(f"[VIDEO] Webcam error {src}: {e}")
-    logger.error("[VIDEO] No valid video source found.")
-    return None
-
-
-# ---------------- Quick test ----------------
-if __name__ == "__main__":
-    cap = find_and_connect_source()
-    if cap is None:
-        logger.error("No video source found. Exiting.")
-        exit(1)
-
-    logger.info("Press ESC to exit.")
-    while True:
-        ok, frame = cap.read() if hasattr(cap, "read") else (False, None)
-        if not ok or frame is None:
-            # REFACTOR: Tăng thời gian chờ lên 0.3s để tránh spam log và giảm tải CPU
-            time.sleep(0.3)
+                return ESP32StreamWrapper(source)
+            except (StreamError, ValueError) as error:
+                logger.warning("ESP32 stream unavailable: %s", error)
             continue
-        cv2.imshow("ESP32 Stream", frame)
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
-
-    if hasattr(cap, "release"):
-        cap.release()
-    cv2.destroyAllWindows()
+        capture = cv2.VideoCapture(source)
+        if capture.isOpened():
+            logger.info("Opened video source %s", source)
+            return capture
+        capture.release()
+    logger.warning("No working video source among %s", list(sources))
+    return None

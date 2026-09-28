@@ -1,169 +1,153 @@
+"""Asterisk alert channel over AMI (Asterisk Manager Interface).
+
+For every configured extension, at the same time:
+  - Originate: ring the phone; the call goes to `hangup_extension` in the
+    dialplan, which plays the alert and hangs up.
+  - MessageSend: SIP text message with the alert.
+
+The alert counts as delivered if at least one extension got a call or a message.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import logging
+from collections.abc import Callable, Sequence
+from typing import Any
 
-from panoramisk.manager import Manager
+from fall_detector.alerts.base import AlertDeliveryError
+from fall_detector.domain import Alert
 
-# Import configuration từ file config
-from fall_detector.settings import ALERT_MESSAGE, CALLER_ID, EXTENSIONS
-
-# Setup logging
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
+
+
+def _default_manager_factory(**kwargs: Any) -> Any:
+    from panoramisk.manager import Manager  # imported here so tests don't need Asterisk libs
+
+    return Manager(**kwargs)
+
+
+def one_line(text: str) -> str:
+    """AMI header values end at a line break, so multi-line text must be joined."""
+    return " | ".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+def is_success(response: Any) -> bool:
+    """AMI replies are a Message (dict-like) or a list of them."""
+    if isinstance(response, list):
+        return any(is_success(item) for item in response)
+    status = response.get("Response", "") if hasattr(response, "get") else getattr(response, "Response", "")
+    return str(status).lower() == "success"
 
 
 class AMITrigger:
-    def __init__(self, host: str, port: int, username: str, secret: str):
-        """Initialize AMI manager with given credentials."""
-        self.manager = Manager(host=host, port=port, username=username, secret=secret)
+    name = "asterisk"
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        username: str,
+        secret: str,
+        *,
+        extensions: Sequence[str],
+        caller_id: str,
+        context: str = "internal",
+        hangup_extension: str = "9999",
+        cleanup_delay_s: float = 3.0,
+        manager_factory: Callable[..., Any] = _default_manager_factory,
+    ) -> None:
         self.host = host
         self.port = port
-        self.username = username
-        self.secret = secret
-
-        self.extensions = EXTENSIONS
-        self.alert_message = ALERT_MESSAGE
-        self.caller_id = CALLER_ID
+        self.extensions = list(extensions)
+        self.caller_id = caller_id
+        self.context = context
+        self.hangup_extension = hangup_extension
+        self.cleanup_delay_s = cleanup_delay_s
+        self._manager = manager_factory(host=host, port=port, username=username, secret=secret)
         self.is_connected = False
+        self._connect_lock = asyncio.Lock()
 
-        # Track last call status per extension
-        self._last_call_status: dict[str, str] = {}
-
-    async def connect(self):
-        """Connect to AMI asynchronously."""
+    async def start(self) -> None:
         try:
-            logger.info(f"[AMI] Connecting to {self.host}:{self.port}...")
-            await self.manager.connect()
+            await self._connect()
+        except Exception as error:
+            logger.warning("Asterisk AMI not reachable at startup (%r); will retry on first alert", error)
+
+    async def _connect(self) -> None:
+        async with self._connect_lock:  # two alerts at once must not open two connections
+            if self.is_connected:
+                return
+            logger.info("Connecting to Asterisk AMI at %s:%s", self.host, self.port)
+            await self._manager.connect()
             self.is_connected = True
-            logger.info("[AMI] ✅ Connected to AMI server.")
-        except Exception as e:
-            self.is_connected = False
-            logger.error(f"[AMI] ❌ Failed to connect: {e}")
-            raise
+            logger.info("Asterisk AMI connected")
 
-    async def _ensure_connected(self) -> bool:
-        """Check and reconnect if disconnected."""
-        if self.is_connected:
-            return True
-        logger.warning("[AMI] ⚠️ Connection lost. Attempting reconnect...")
+    async def send(self, alert: Alert) -> None:
         try:
-            await self.connect()
-            return True
-        except Exception:
-            return False
+            await self._connect()
+        except Exception as error:
+            raise AlertDeliveryError(f"AMI connect failed: {error!r}") from error
 
-    async def alert_devices(self, message: str = None):
-        """Send alert to all configured extensions."""
-        message = message or self.alert_message
+        results = await asyncio.gather(
+            *(self._alert_extension(ext, alert.message) for ext in self.extensions)
+        )
+        reached = [ext for ext, ok in zip(self.extensions, results, strict=True) if ok]
 
-        if not await self._ensure_connected():
-            logger.warning("[AMI] Alert aborted due to connection failure.")
-            return
+        # Give Asterisk time to clean up channels before the next alert.
+        await asyncio.sleep(self.cleanup_delay_s)
 
-        logger.info(f"[AMI] Triggering alert to {len(self.extensions)} device(s)...")
+        if not reached:
+            raise AlertDeliveryError(f"no extension reached out of {self.extensions}")
+        if len(reached) < len(self.extensions):
+            logger.warning("Asterisk reached only %s of %s", reached, self.extensions)
 
-        # Gửi alert song song
-        tasks = [self._handle_extension(ext, message) for ext in self.extensions]
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Đợi 3s cho channel cleanup
-        CLEANUP_DELAY_SECONDS = 3
-        await asyncio.sleep(CLEANUP_DELAY_SECONDS)
-        logger.info("[AMI] Alert process finished.")
-
-    async def _handle_extension(self, extension: str, message: str):
-        """Send call and message to a single extension concurrently."""
-        await asyncio.gather(self._originate_call(extension, message), self._send_message(extension, message))
+    async def _alert_extension(self, extension: str, message: str) -> bool:
+        call_ok, text_ok = await asyncio.gather(
+            self._originate_call(extension, message), self._send_message(extension, message)
+        )
+        return call_ok or text_ok
 
     async def _originate_call(self, extension: str, message: str) -> bool:
-        """
-        Originate a call to the hangup point 9999.
-        Returns True if queued successfully.
-        """
-        if not await self._ensure_connected():
-            logger.warning(f"[📞 CALL] → {extension} | Connection lost, abort call.")
-            return False
+        return await self._action(
+            f"call {extension}",
+            {
+                "Action": "Originate",
+                "Channel": f"PJSIP/{extension}",
+                "Context": self.context,
+                "Exten": self.hangup_extension,
+                "Priority": 1,
+                "CallerID": self.caller_id,
+                "Variable": f"ALERT_MSG={one_line(message)}",
+                "Async": "true",
+            },
+        )
 
+    async def _send_message(self, extension: str, message: str) -> bool:
+        return await self._action(
+            f"message {extension}",
+            {
+                "Action": "MessageSend",
+                "To": f"pjsip:{extension}",
+                "From": "server",
+                "Body": one_line(message),
+            },
+        )
+
+    async def _action(self, description: str, action: dict[str, Any]) -> bool:
         try:
-            response: dict | list = await self.manager.send_action(
-                {
-                    "Action": "Originate",
-                    "Channel": f"PJSIP/{extension}",
-                    "Context": "internal",
-                    "Exten": "9999",  # Hangup point trong extensions.ael
-                    "Priority": 1,
-                    "CallerID": self.caller_id,
-                    "Variable": f"ALERT_MSG={message}",
-                    "Async": "true",
-                }
-            )
-
-            # Nếu trả về list of Messages, kiểm tra từng message
-            if isinstance(response, list):
-                success_msgs = [msg for msg in response if getattr(msg, "Response", "").lower() == "success"]
-                failure_msgs = [msg for msg in response if getattr(msg, "Response", "").lower() == "failure"]
-
-                if success_msgs:
-                    self._last_call_status[extension] = "Success"
-                    logger.info(
-                        f"[📞 CALL] → {extension} | Originate queued successfully ({len(success_msgs)} success)"
-                    )
-                    return True
-                else:
-                    self._last_call_status[extension] = "Failure"
-                    logger.warning(
-                        f"[📞 CALL] → {extension} | All originate messages failed ({len(failure_msgs)} failure)"
-                    )
-                    return False
-
-            # Nếu dict (trường hợp cũ)
-            elif isinstance(response, dict):
-                status = response.get("Response", "Unknown")
-                msg = response.get("Message", "")
-                self._last_call_status[extension] = status
-                logger.info(f"[📞 CALL] → {extension} | Status: {status} - {msg}")
-                return status.lower() == "success"
-
-            else:
-                logger.error(f"[📞 CALL] → {extension} | ❌ Unexpected AMI response type: {type(response)}")
-                return False
-
-        except Exception as e:
-            logger.error(f"[📞 CALL] → {extension} | ❌ Error: {e}")
-            self.is_connected = False
+            response = await self._manager.send_action(action)
+        except Exception as error:
+            logger.error("Asterisk %s failed: %r", description, error)
+            self.is_connected = False  # reconnect on next alert
             return False
+        ok = is_success(response)
+        log = logger.info if ok else logger.warning
+        log("Asterisk %s: %s", description, "ok" if ok else f"failed ({response!r})")
+        return ok
 
-    async def _send_message(self, extension: str, message: str):
-        """Send SIP MESSAGE to the extension via server endpoint."""
-        if not await self._ensure_connected():
-            logger.warning(f"[📨 SMS] → {extension} | Connection lost, abort SMS.")
-            return False
-
-        try:
-            response = await self.manager.send_action(
-                {"Action": "MessageSend", "To": f"pjsip:{extension}", "From": "server", "Body": message}
-            )
-            status = response.get("Response", "Unknown")
-            msg = response.get("Message", "")
-            logger.info(f"[📨 SMS] → {extension} | Status: {status} - {msg}")
-            return status.lower() == "success"
-        except Exception as e:
-            logger.error(f"[📨 SMS] → {extension} | ❌ Error: {e}")
-            self.is_connected = False
-            return False
-
-    async def close(self):
-        """Disconnect safely from AMI."""
+    async def close(self) -> None:
         if self.is_connected:
-            self.manager.close()
+            self._manager.close()
             self.is_connected = False
-            logger.info("[AMI] 🔌 Disconnected from AMI server.")
-
-
-# === Example usage ===
-# async def main():
-#     ami = AMITrigger(host="127.0.0.1", port=5038, username="hx", secret="123")
-#     await ami.connect()
-#     await ami.alert_devices("⚠️ Cảnh báo: Ngã phát hiện tại vị trí!")
-#     await ami.close()
-#
-# asyncio.run(main())
+            logger.info("Asterisk AMI disconnected")

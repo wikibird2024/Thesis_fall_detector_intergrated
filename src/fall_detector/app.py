@@ -1,279 +1,269 @@
+"""Composition root: builds every component from Settings, runs them, stops them cleanly.
+
+This is the only module that knows about all the concrete classes. Everything
+else receives what it needs through its constructor (dependency injection),
+which is why tests can swap YOLO, Telegram or Asterisk for fakes.
+
+    start:  migrate DB -> start alert channels -> start supervised tasks
+            [alerts] [mqtt] [mqtt_consumer] [camera] [heartbeat]
+    stop:   (Ctrl+C, SIGTERM, or 'q' in the window)
+            stop inputs -> deliver queued alerts (drain) -> stop the rest -> close channels
+"""
+
+from __future__ import annotations
+
 import asyncio
+import contextlib
 import logging
+import signal
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
 
-import cv2
-
-from fall_detector.alerts.ami_trigger import AMITrigger
-from fall_detector.alerts.telegram_bot import TelegramBot
+from fall_detector.alerts.base import AlertChannel
+from fall_detector.alerts.dispatcher import AlertDispatcher
 from fall_detector.inputs.mqtt_client import MQTTClient
-from fall_detector.inputs.video_source import find_and_connect_source
+from fall_detector.inputs.video_source import VideoSource, find_and_connect_source
+from fall_detector.observability import metrics
+from fall_detector.processing.camera_pipeline import CameraPipeline
 from fall_detector.processing.detection_processor import DetectionProcessor
+from fall_detector.runtime.supervisor import TaskSupervisor
+from fall_detector.settings import Settings
+from fall_detector.storage.repository import FallEventRepository
+from fall_detector.vision.analyzer import FrameAnalyzer
 
-# Thêm nhập hàm cấu hình nguồn video
-# Import all configuration variables
-from fall_detector.settings import (
-    AMI_HOST,
-    AMI_PORT,
-    AMI_SECRET,
-    AMI_USERNAME,
-    ENABLE_AMI,
-    ENABLE_MQTT,
-    ENABLE_TELEGRAM,
-    HUMAN_DETECTION_CONFIDENCE_THRESHOLD,
-    IOU_THRESHOLD,
-    MQTT_BROKER_HOST,
-    MQTT_BROKER_PORT,
-    MQTT_PASSWORD,
-    MQTT_TOPIC,
-    MQTT_USERNAME,
-    POSE_MIN_DETECTION_CONFIDENCE,
-    POSE_MIN_TRACKING_CONFIDENCE,
-    POSE_MODEL_COMPLEXITY,
-    TELEGRAM_BOT_TOKEN,
-    TELEGRAM_CHAT_ID,
-    get_video_sources,
-    validate_config,
-)
-from fall_detector.storage.database_manager import create_table
+logger = logging.getLogger(__name__)
 
-# Import application modules
-from fall_detector.vision.human_detector import HumanDetector
-from fall_detector.vision.person_tracker import PersonTracker
-from fall_detector.vision.skeleton_tracker import SkeletonTracker
-
-# Setup logger
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("fall_system")
+HEARTBEAT_INTERVAL_S = 60.0
+INPUT_TASKS = ("camera", "mqtt", "mqtt_consumer")
+MAX_FRAME_AGE_FOR_READY_S = 10.0
 
 
-async def camera_processing_loop(cap, human_detector, skeleton_tracker, person_tracker, detection_processor):
-    """
-    Camera processing loop supporting multiple sources in priority order.
-    `cap` can be a cv2.VideoCapture or ESP32StreamWrapper.
-    """
-    if cap is None:
-        logger.error("[CAMERA] No working video source found, exiting camera loop")
-        return
+@dataclass
+class Components:
+    """Everything the app runs. `build_components` makes the real ones; tests pass fakes."""
 
-    try:
-        frame_count = 0
-        while True:
-            # Async-safe read
-            if hasattr(cap, "read"):
-                # ESP32StreamWrapper or cv2.VideoCapture
-                ret, frame = await asyncio.to_thread(cap.read)
-            else:
-                logger.error("[CAMERA] Invalid video source object")
-                break
-
-            if not ret or frame is None:
-                # REFACTOR: Tăng thời gian chờ lên (từ 0.05s lên 0.3s)
-                # Điều này giúp giảm spam log "Failed to read frame" khi camera mất kết nối tạm thời.
-                logger.warning("[CAMERA] Failed to read frame, sleeping 0.3s...")
-                await asyncio.sleep(0.3)
-                continue
-
-            # Detect humans (YOLOv8 inference — run off the event loop)
-            detected_boxes = await asyncio.to_thread(human_detector.detect_humans, frame)
-            tracked_people = person_tracker.update(detected_boxes)
-
-            # Track skeletons and handle detection (MediaPipe inference — run off the event loop)
-            for person_id, box in tracked_people:
-                landmarks = await asyncio.to_thread(skeleton_tracker.track_from_box, frame, box)
-                await detection_processor.handle_camera_data(frame, person_id, box, landmarks)
-
-            # Free memory for people no longer in frame
-            detection_processor.evict_stale_detectors()
-
-            # Optional: display frame
-            cv2.imshow("Fall Detection", frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                logger.info("[CAMERA] User pressed 'q', stopping camera...")
-                break
-
-            frame_count += 1
-            if frame_count % 100 == 0:
-                logger.info(f"[CAMERA] Processed {frame_count} frames")
-
-            # Tối ưu: Dùng sleep ngắn hơn khi đọc thành công để tăng FPS/giảm latency,
-            # nhưng vẫn nhường quyền kiểm soát cho event loop.
-            await asyncio.sleep(0.001)
-
-    except asyncio.CancelledError:
-        logger.info("[CAMERA] Camera processing task cancelled")
-    except Exception as e:
-        logger.exception(f"[CAMERA] Error in camera processing: {e}")
-    finally:
-        if cap:
-            logger.info("[CAMERA] Releasing camera...")
-            if hasattr(cap, "release"):
-                await asyncio.to_thread(cap.release)
-            cv2.destroyAllWindows()
+    repository: FallEventRepository
+    channels: list[AlertChannel] = field(default_factory=list)
+    mqtt_client: MQTTClient | None = None
+    analyzer: FrameAnalyzer | None = None  # None = camera disabled
+    open_video_source: Callable[[], VideoSource | None] | None = None
 
 
-async def heartbeat_loop():
-    """Heartbeat loop to keep program alive and show it's working."""
-    try:
-        while True:
-            await asyncio.sleep(60)
-            logger.info("[SYSTEM] Heartbeat - all tasks running")
-    except asyncio.CancelledError:
-        logger.info("[SYSTEM] Heartbeat cancelled")
+async def build_components(settings: Settings) -> Components:
+    """Create real components. Async because AMI must be created inside the running loop."""
+    channels: list[AlertChannel] = []
+    if settings.telegram.enabled:
+        from fall_detector.alerts.telegram_bot import TelegramBot
 
+        assert settings.telegram.bot_token and settings.telegram.chat_id  # checked by Settings
+        channels.append(
+            TelegramBot(
+                settings.telegram.bot_token.get_secret_value(),
+                settings.telegram.chat_id,
+                send_startup_message=settings.telegram.send_startup_message,
+            )
+        )
+    if settings.ami.enabled:
+        from fall_detector.alerts.ami_trigger import AMITrigger
 
-async def mqtt_processor_loop(mqtt_client: MQTTClient, detection_processor: DetectionProcessor):
-    """Background task to process MQTT messages from the queue."""
-    logger.info("[MQTT] Processor started")
-    try:
-        while mqtt_client.is_running():
-            try:
-                mqtt_msg = await mqtt_client.get_message(timeout=1.0)
-                logger.info(f"[MQTT] Processing message: {mqtt_msg}")
-                await detection_processor.handle_mqtt_data(mqtt_msg)
-            except asyncio.TimeoutError:
-                pass
-    except asyncio.CancelledError:
-        logger.info("[MQTT] Processor task cancelled.")
-    except Exception as e:
-        logger.exception(f"[MQTT] Processor error: {e}")
-        raise
-
-
-async def cleanup_resources(skeleton_tracker, ami_trigger):
-    """Final cleanup of resources that need explicit closing."""
-    logger.info("[SYSTEM] Final cleanup...")
-
-    if skeleton_tracker:
-        try:
-            skeleton_tracker.close()
-            logger.info("[SKELETON] Skeleton tracker closed")
-        except Exception as e:
-            logger.warning(f"[SKELETON] Error closing: {e}")
-
-    if ami_trigger and getattr(ami_trigger, "is_connected", False):
-        try:
-            await ami_trigger.close()
-            logger.info("[AMI] AMI connection closed")
-        except Exception as e:
-            logger.warning(f"[AMI] Error closing: {e}")
-
-    logger.info("[SYSTEM] Cleanup completed")
-
-
-async def main():
-    """Main async function to run the fall detection system."""
+        ami = settings.ami
+        assert ami.username and ami.secret
+        channels.append(
+            AMITrigger(
+                ami.host, ami.port, ami.username, ami.secret.get_secret_value(),
+                extensions=ami.extensions, caller_id=ami.caller_id, context=ami.context,
+                hangup_extension=ami.hangup_extension, cleanup_delay_s=ami.cleanup_delay_s,
+            )
+        )  # fmt: skip
 
     mqtt_client = None
-    skeleton_tracker = None
-    ami_trigger = None
-    tasks = []
+    if settings.mqtt.enabled:
+        m = settings.mqtt
+        mqtt_client = MQTTClient(
+            m.host, m.port, m.topic, m.username, m.password.get_secret_value() if m.password else None,
+            qos=m.qos, keepalive_s=m.keepalive_s, queue_size=m.queue_size,
+            reconnect_min_s=m.reconnect_min_s, reconnect_max_s=m.reconnect_max_s,
+        )  # fmt: skip
 
-    try:
-        validate_config()
-        logger.info("[SYSTEM] Initializing modules...")
-        human_detector = HumanDetector(
-            conf_threshold=HUMAN_DETECTION_CONFIDENCE_THRESHOLD, iou_threshold=IOU_THRESHOLD
+    analyzer = None
+    open_video_source = None
+    if settings.camera.enabled:
+        logger.info("Loading vision models (YOLO %s, MediaPipe Pose)...", settings.vision.model_path)
+        analyzer = await asyncio.to_thread(build_analyzer, settings)
+        sources = settings.camera.sources()
+
+        def open_video_source() -> VideoSource | None:
+            return find_and_connect_source(sources)
+
+    return Components(
+        repository=FallEventRepository(settings.database.path),
+        channels=channels,
+        mqtt_client=mqtt_client,
+        analyzer=analyzer,
+        open_video_source=open_video_source,
+    )
+
+
+def build_analyzer(settings: Settings) -> FrameAnalyzer:
+    from fall_detector.vision.analyzer import PoseFrameAnalyzer
+    from fall_detector.vision.human_detector import HumanDetector
+    from fall_detector.vision.person_tracker import PersonTracker
+    from fall_detector.vision.skeleton_tracker import SkeletonTracker
+
+    v = settings.vision
+    return PoseFrameAnalyzer(
+        HumanDetector(
+            v.model_path, conf_threshold=v.person_confidence_min, iou_threshold=v.nms_iou_threshold
+        ),
+        PersonTracker(iou_threshold=v.track_iou_threshold),
+        SkeletonTracker(
+            v.pose_model_complexity, v.pose_min_detection_confidence, v.pose_min_tracking_confidence
+        ),
+    )
+
+
+class Application:
+    def __init__(self, settings: Settings, components: Components) -> None:
+        self.settings = settings
+        self.components = components
+        self.supervisor = TaskSupervisor(
+            on_restart=lambda name: metrics.TASK_RESTARTS.labels(task=name).inc()
         )
-        skeleton_tracker = SkeletonTracker(
-            model_complexity=POSE_MODEL_COMPLEXITY,
-            min_detection_confidence=POSE_MIN_DETECTION_CONFIDENCE,
-            min_tracking_confidence=POSE_MIN_TRACKING_CONFIDENCE,
+        a = settings.alerts
+        self.dispatcher = AlertDispatcher(
+            components.channels,
+            components.repository,
+            queue_size=a.queue_size,
+            workers=a.workers,
+            channel_timeout_s=a.channel_timeout_s,
+            retry_policy=a.retry_policy(),
         )
-        person_tracker = PersonTracker(iou_threshold=IOU_THRESHOLD)
-        ami_trigger = AMITrigger(host=AMI_HOST, port=AMI_PORT, username=AMI_USERNAME, secret=AMI_SECRET)
-
-        telegram_bot = None
-        if ENABLE_TELEGRAM:
-            telegram_bot = TelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-            logger.info("[TELEGRAM] Bot initialized.")
-
-        detection_processor = DetectionProcessor(ami_trigger, telegram_bot)
-
-        # Initialize the database
-        create_table()
-        logger.info("[DB] Database and table created successfully.")
-
-        # Start MQTT tasks
-        if ENABLE_MQTT:
-            try:
-                mqtt_client = MQTTClient(
-                    broker=MQTT_BROKER_HOST,
-                    port=MQTT_BROKER_PORT,
-                    topic=MQTT_TOPIC,
-                    username=MQTT_USERNAME,
-                    password=MQTT_PASSWORD,
-                )
-                tasks.append(asyncio.create_task(mqtt_client.run_forever(), name="mqtt_listener"))
-                logger.info("[MQTT] MQTT listener task created")
-            except Exception as e:
-                logger.warning(f"[MQTT] Could not start MQTT: {e}")
-                mqtt_client = None
-        else:
-            logger.info("[MQTT] Disabled by configuration.")
-
-        # Wait for MQTT connection
-        if mqtt_client:
-            try:
-                await asyncio.wait_for(mqtt_client.connected_event.wait(), timeout=10)
-                logger.info("[MQTT] MQTT client connected.")
-                tasks.append(
-                    asyncio.create_task(
-                        mqtt_processor_loop(mqtt_client, detection_processor), name="mqtt_processor"
-                    )
-                )
-                logger.info("[MQTT] MQTT processor task created")
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "[MQTT] Timeout waiting for MQTT connection. Proceeding without MQTT processing."
-                )
-
-        # Connect AMI trigger
-        if ENABLE_AMI:
-            try:
-                await ami_trigger.connect()
-            except Exception as e:
-                logger.warning(f"[AMI] Error connecting to AMI: {e}. Proceeding without AMI functionality.")
-                ami_trigger.is_connected = False
-        else:
-            logger.info("[AMI] AMI functionality is disabled.")
-            ami_trigger.is_connected = False
-
-        # Get camera source
-        source_priority_list = get_video_sources()
-        cap = find_and_connect_source(source_priority_list)
-
-        # Start camera processing task
-        camera_task = asyncio.create_task(
-            camera_processing_loop(
-                cap, human_detector, skeleton_tracker, person_tracker, detection_processor
-            ),
-            name="camera_processing",
+        self.processor = DetectionProcessor(
+            self.dispatcher,
+            thresholds=settings.fall.thresholds(),
+            cooldown_s=a.cooldown_s,
+            forget_after_s=a.forget_after_s,
         )
-        tasks.append(camera_task)
+        self.pipeline: CameraPipeline | None = None
+        if components.analyzer is not None and components.open_video_source is not None:
+            c = settings.camera
+            self.pipeline = CameraPipeline(
+                components.open_video_source,
+                components.analyzer,
+                self.processor,
+                show_window=c.show_window,
+                on_quit=self.request_stop,
+                reconnect_delay_s=c.reconnect_delay_s,
+                max_failed_reads=c.max_failed_reads,
+            )
+        self._stop_requested = asyncio.Event()
+        self.started_at = time.monotonic()
 
-        # Start heartbeat task
-        heartbeat_task = asyncio.create_task(heartbeat_loop(), name="heartbeat")
-        tasks.append(heartbeat_task)
+    def request_stop(self) -> None:
+        if not self._stop_requested.is_set():
+            logger.info("Stop requested")
+            self._stop_requested.set()
 
-        logger.info(f"[SYSTEM] Starting {len(tasks)} concurrent tasks...")
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    async def run(self) -> None:
+        self._install_signal_handlers()
+        await self.start()
+        try:
+            await self._stop_requested.wait()
+        finally:
+            await self.stop()
 
-        for task in done:
-            if task.exception():
-                logger.error(f"[SYSTEM] Task {task.get_name()} failed: {task.exception()}")
-            else:
-                logger.info(f"[SYSTEM] Task {task.get_name()} completed normally.")
+    async def start(self) -> None:
+        c = self.components
+        version = await asyncio.to_thread(c.repository.migrate)
+        logger.info("Database ready: %s (schema v%d)", c.repository.path, version)
+        for channel in c.channels:
+            await channel.start()
+        logger.info("Alert channels: %s", [ch.name for ch in c.channels] or "none")
 
-        # Cancel remaining tasks
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.wait(pending, timeout=5.0)
+        self.supervisor.start("alerts", self.dispatcher.run)
+        if c.mqtt_client is not None:
+            self.supervisor.start("mqtt", c.mqtt_client.run_forever)
+            self.supervisor.start("mqtt_consumer", self._consume_mqtt)
+        if self.pipeline is not None:
+            self.supervisor.start("camera", self.pipeline.run, restart_on_exit=False)
+        self.supervisor.start("heartbeat", self._heartbeat)
+        logger.info(
+            "Fall detector running (camera=%s, mqtt=%s)", self.pipeline is not None, c.mqtt_client is not None
+        )
 
-    except KeyboardInterrupt:
-        logger.info("[SYSTEM] Keyboard interrupt received")
-    except Exception as e:
-        logger.exception(f"[SYSTEM] Unexpected error: {e}")
-    finally:
-        await cleanup_resources(skeleton_tracker, ami_trigger)
+    async def stop(self) -> None:
+        logger.info("Shutting down...")
+        await self.supervisor.stop(names=INPUT_TASKS)  # 1. no new events
+        await self.dispatcher.drain(self.settings.alerts.shutdown_drain_s)  # 2. finish queued alerts
+        await self.supervisor.stop()  # 3. everything else
+        await self.dispatcher.close()  # 4. close channels
+        if self.components.analyzer is not None:
+            with contextlib.suppress(Exception):
+                self.components.analyzer.close()
+        logger.info("Stopped")
+
+    async def _consume_mqtt(self) -> None:
+        assert self.components.mqtt_client is not None
+        queue = self.components.mqtt_client.messages
+        while True:
+            message = await queue.get()
+            self.processor.handle_mqtt_data(message)
+            self.processor.evict_stale()
+
+    async def _heartbeat(self) -> None:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+            status = self.status()
+            logger.info(
+                "Heartbeat: ready=%s camera=%s mqtt=%s alert_queue=%d",
+                status["ready"], status["camera"], status["mqtt"], status["alerts"]["queued"],
+            )  # fmt: skip
+
+    def status(self) -> dict[str, Any]:
+        """Snapshot for the heartbeat and the /health/ready endpoint."""
+        now = time.monotonic()
+        camera: dict[str, Any] = {"enabled": self.pipeline is not None}
+        if self.pipeline is not None:
+            age = None if self.pipeline.last_frame_at is None else round(now - self.pipeline.last_frame_at, 1)
+            camera.update(connected=self.pipeline.is_connected, frames=self.pipeline.frames_processed,
+                          last_frame_age_s=age)  # fmt: skip
+        mqtt_client = self.components.mqtt_client
+        mqtt: dict[str, Any] = {"enabled": mqtt_client is not None}
+        if mqtt_client is not None:
+            mqtt["connected"] = mqtt_client.is_connected
+
+        tasks = {
+            name: {"running": s.is_running, "restarts": s.restarts, "last_error": s.last_error}
+            for name, s in self.supervisor.states.items()
+        }
+        camera_ok = not camera["enabled"] or (
+            camera.get("last_frame_age_s") is not None
+            and camera["last_frame_age_s"] < MAX_FRAME_AGE_FOR_READY_S
+        )
+        mqtt_ok = not mqtt["enabled"] or mqtt["connected"]
+        alerts_ok = tasks.get("alerts", {}).get("running", False)
+        return {
+            "ready": bool(camera_ok and mqtt_ok and alerts_ok),
+            "uptime_s": round(now - self.started_at),
+            "camera": camera,
+            "mqtt": mqtt,
+            "alerts": {
+                "queued": self.dispatcher.pending,
+                "channels": [c.name for c in self.dispatcher.channels],
+            },
+            "tasks": tasks,
+        }
+
+    def _install_signal_handlers(self) -> None:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            # Not available on Windows or outside the main thread; Ctrl+C then raises KeyboardInterrupt.
+            with contextlib.suppress(NotImplementedError, RuntimeError):
+                loop.add_signal_handler(sig, self.request_stop)
+
+
+async def run(settings: Settings) -> None:
+    components = await build_components(settings)
+    await Application(settings, components).run()
