@@ -47,8 +47,9 @@ def lying(y: float = 400.0, left: float = 200.0, right: float = 400.0, **kwargs)
     return make_landmarks((left, y), (right, y), **kwargs)
 
 
-def tilted(angle_from_vertical_deg: float, hip: tuple[float, float] = (320.0, 300.0), length: float = 200.0,
-           **kwargs) -> list[list[float]]:
+def tilted(
+    angle_from_vertical_deg: float, hip: tuple[float, float] = (320.0, 300.0), length: float = 200.0, **kwargs
+) -> list[list[float]]:
     """Torso rotated away from vertical by the given angle, pivoting on the hips."""
     rad = math.radians(angle_from_vertical_deg)
     shoulder = (hip[0] + math.sin(rad) * length, hip[1] - math.cos(rad) * length)

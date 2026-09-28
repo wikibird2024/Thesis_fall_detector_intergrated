@@ -15,8 +15,16 @@ def raw_message(payload) -> SimpleNamespace:
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [(True, True), ("true", True), ("YES", True), ("1", True), (1, True), ("false", False), (0, False),
-     (None, False)],
+    [
+        (True, True),
+        ("true", True),
+        ("YES", True),
+        ("1", True),
+        (1, True),
+        ("false", False),
+        (0, False),
+        (None, False),
+    ],
 )
 def test_to_bool_accepts_common_spellings(raw, expected):
     assert MQTTClient._to_bool(raw) is expected
@@ -24,7 +32,9 @@ def test_to_bool_accepts_common_spellings(raw, expected):
 
 async def test_valid_payload_is_normalized_and_queued():
     client = MQTTClient()
-    await client._process_message(raw_message({"device_id": "d1", "fall_detected": "true", "latitude": "10.5"}))
+    await client._process_message(
+        raw_message({"device_id": "d1", "fall_detected": "true", "latitude": "10.5"})
+    )
 
     queued = client.message_queue.get_nowait()
     assert queued["device_id"] == "d1"

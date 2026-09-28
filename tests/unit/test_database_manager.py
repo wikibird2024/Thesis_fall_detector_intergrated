@@ -12,8 +12,14 @@ def temp_database(tmp_path, monkeypatch):
 
 
 def event(**overrides):
-    data = {"timestamp": 1_700_000_000, "device_id": "d1", "fall_detected": True,
-            "latitude": 1.0, "longitude": 2.0, "has_gps_fix": True}
+    data = {
+        "timestamp": 1_700_000_000,
+        "device_id": "d1",
+        "fall_detected": True,
+        "latitude": 1.0,
+        "longitude": 2.0,
+        "has_gps_fix": True,
+    }
     data.update(overrides)
     return data
 

@@ -1,178 +1,127 @@
-import math
+"""Per-person fall decision from pose landmarks.
 
-from fall_detector import settings as config  # Import thresholds and configuration values
+One FallDetector instance follows one person across frames. It confirms a fall
+in two ways:
+
+  active fall : torso tilted past the threshold AND moving fast,
+                for `falling_frames` frames in a row
+  lying state : torso tilted past threshold + margin (nearly horizontal),
+                for `lying_frames` frames in a row
+
+Geometry (image coordinates, y grows downward):
+
+        shoulder mid  *            tilt =  0 deg  standing
+                      |\\           tilt = 90 deg  lying
+                      | \\ tilt     tilt = 180 deg upside down
+        hip mid       *--
+
+This module has no I/O and no config imports: it only needs FallThresholds,
+which makes it easy to unit test and reuse.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+# MediaPipe Pose landmark: [x, y, z, visibility]. z is depth, not confidence.
+Landmark = Sequence[float]
+
+LEFT_SHOULDER = 11
+RIGHT_SHOULDER = 12
+LEFT_HIP = 23
+RIGHT_HIP = 24
+KEY_POINTS = (LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP)
+LANDMARK_COUNT = 33
+VISIBILITY_INDEX = 3
+
+
+@dataclass(frozen=True)
+class FallThresholds:
+    """Tuning values for FallDetector. Defaults match the original thesis values."""
+
+    tilt_threshold_deg: float = 60.0  # torso tilt from vertical that counts as "not upright"
+    lying_margin_deg: float = 10.0  # extra tilt on top of the threshold that counts as lying
+    velocity_threshold_px: float = 0.5  # torso center movement per frame, in pixels
+    falling_frames: int = 5  # frames in a row of "tilted and moving" to confirm
+    lying_frames: int = 5  # frames in a row of "lying" to confirm
+    min_visibility: float = 0.5  # shoulders and hips must be at least this visible
+
+
+def torso_tilt_deg(landmarks: Sequence[Landmark]) -> float:
+    """Angle between the hip->shoulder line and straight up, in degrees [0, 180]."""
+    shoulder_x = (landmarks[LEFT_SHOULDER][0] + landmarks[RIGHT_SHOULDER][0]) / 2
+    shoulder_y = (landmarks[LEFT_SHOULDER][1] + landmarks[RIGHT_SHOULDER][1]) / 2
+    hip_x = (landmarks[LEFT_HIP][0] + landmarks[RIGHT_HIP][0]) / 2
+    hip_y = (landmarks[LEFT_HIP][1] + landmarks[RIGHT_HIP][1]) / 2
+    dx = shoulder_x - hip_x
+    dy = shoulder_y - hip_y
+    # "Up" in image coordinates is (0, -1), so -dy is the upward component.
+    return math.degrees(math.atan2(abs(dx), -dy))
+
+
+def torso_center(landmarks: Sequence[Landmark]) -> tuple[float, float]:
+    x = sum(landmarks[i][0] for i in KEY_POINTS) / len(KEY_POINTS)
+    y = sum(landmarks[i][1] for i in KEY_POINTS) / len(KEY_POINTS)
+    return x, y
 
 
 class FallDetector:
-    """
-    Fall detector improved to detect falls in all directions,
-    including sideways and forward/backward.
-    """
+    """Stateful fall decision for one tracked person."""
 
-    def __init__(
-        self,
-        torso_angle_threshold_vertical: float = None,
-        torso_angle_threshold_horizontal: float = None,
-        velocity_threshold: float = None,
-        fall_duration_threshold: int = None,
-        fall_state_duration_threshold: int = None,
-        min_landmark_confidence: float = None,
-    ):
-        # Thresholds and configuration parameters
-        self.TORSO_ANGLE_THRESHOLD_VERTICAL = (
-            torso_angle_threshold_vertical or config.TORSO_ANGLE_THRESHOLD_VERTICAL
-        )
-        self.TORSO_ANGLE_THRESHOLD_HORIZONTAL = (
-            torso_angle_threshold_horizontal or config.TORSO_ANGLE_THRESHOLD_HORIZONTAL
-        )
-        self.VELOCITY_THRESHOLD = velocity_threshold or config.VELOCITY_THRESHOLD
-        self.FALL_DURATION_THRESHOLD = fall_duration_threshold or config.FALL_DURATION_THRESHOLD
-        self.FALL_STATE_DURATION_THRESHOLD = (
-            fall_state_duration_threshold or config.FALL_STATE_DURATION_THRESHOLD
-        )
-        self.MIN_LANDMARK_CONFIDENCE = min_landmark_confidence or config.MIN_LANDMARK_CONFIDENCE
+    def __init__(self, thresholds: FallThresholds | None = None) -> None:
+        self.thresholds = thresholds or FallThresholds()
+        self.frames_falling = 0
+        self.frames_lying = 0
+        self.previous_center: tuple[float, float] | None = None
 
-        # Internal state counters to track consecutive fall frames
-        self.consecutive_frames_fallen = 0
-        self.frames_in_fall_state = 0
+    def reset(self) -> None:
+        """Clear state after a confirmed fall or when landmarks are unreliable."""
+        self.frames_falling = 0
+        self.frames_lying = 0
+        self.previous_center = None
 
-        # Store previous torso center to calculate velocity between frames
-        self.previous_torso_center: tuple[float, float] | None = None
-
-        # Indices of key landmarks (based on standard pose detection model)
-        self.LEFT_SHOULDER = 11
-        self.RIGHT_SHOULDER = 12
-        self.LEFT_HIP = 23
-        self.RIGHT_HIP = 24
-
-    def reset(self):
-        """Reset internal state after a fall is detected or landmarks are invalid."""
-        self.consecutive_frames_fallen = 0
-        self.frames_in_fall_state = 0
-        self.previous_torso_center = None
-
-    def _calculate_torso_angle(self, landmarks: list[tuple[float, float]]) -> tuple[float, float]:
-        """
-        Calculate torso angles relative to vertical and horizontal axes.
-
-        Args:
-            landmarks: List of (x, y) coordinates for each body keypoint.
-
-        Returns:
-            angle_vertical: angle between torso and vertical axis (degrees)
-            angle_horizontal: angle between torso and horizontal axis (degrees)
-        """
-        left_shoulder = landmarks[self.LEFT_SHOULDER]
-        right_shoulder = landmarks[self.RIGHT_SHOULDER]
-        left_hip = landmarks[self.LEFT_HIP]
-        right_hip = landmarks[self.RIGHT_HIP]
-
-        # Midpoints of shoulders and hips to define the torso line
-        torso_top = ((left_shoulder[0] + right_shoulder[0]) / 2, (left_shoulder[1] + right_shoulder[1]) / 2)
-        torso_bottom = ((left_hip[0] + right_hip[0]) / 2, (left_hip[1] + right_hip[1]) / 2)
-
-        dx = torso_top[0] - torso_bottom[0]  # Horizontal component
-        dy = torso_top[1] - torso_bottom[1]  # Vertical component
-
-        # Angle calculation using arctangent
-        angle_vertical = abs(math.degrees(math.atan2(dx, dy)))  # Deviation from vertical
-        angle_horizontal = abs(math.degrees(math.atan2(dy, dx)))  # Deviation from horizontal
-
-        return angle_vertical, angle_horizontal
-
-    def _calculate_velocity(self, landmarks: list[tuple[float, float]]) -> float:
-        """
-        Calculate torso velocity based on movement between consecutive frames.
-
-        Args:
-            landmarks: List of (x, y) coordinates for each body keypoint.
-
-        Returns:
-            velocity magnitude in pixels per frame
-        """
-        left_shoulder = landmarks[self.LEFT_SHOULDER]
-        right_shoulder = landmarks[self.RIGHT_SHOULDER]
-        left_hip = landmarks[self.LEFT_HIP]
-        right_hip = landmarks[self.RIGHT_HIP]
-
-        # Torso center as average of shoulder and hip keypoints
-        torso_center = (
-            (left_shoulder[0] + right_shoulder[0] + left_hip[0] + right_hip[0]) / 4,
-            (left_shoulder[1] + right_shoulder[1] + left_hip[1] + right_hip[1]) / 4,
+    def has_reliable_key_points(self, landmarks: Sequence[Landmark]) -> bool:
+        if len(landmarks) < LANDMARK_COUNT:
+            return False
+        return all(
+            len(landmarks[i]) > VISIBILITY_INDEX
+            and landmarks[i][VISIBILITY_INDEX] >= self.thresholds.min_visibility
+            for i in KEY_POINTS
         )
 
-        # First frame: cannot compute velocity
-        if self.previous_torso_center is None:
-            self.previous_torso_center = torso_center
+    def _speed_px(self, landmarks: Sequence[Landmark]) -> float:
+        center = torso_center(landmarks)
+        previous, self.previous_center = self.previous_center, center
+        if previous is None:
             return 0.0
+        return math.dist(center, previous)
 
-        # Velocity vector = difference between current and previous torso center
-        vx = torso_center[0] - self.previous_torso_center[0]
-        vy = torso_center[1] - self.previous_torso_center[1]
-        velocity_mag = math.sqrt(vx**2 + vy**2)  # Euclidean distance
-
-        self.previous_torso_center = torso_center  # Update previous torso position
-        return velocity_mag
-
-    def detect_fall(self, landmarks: list[tuple[float, float]]) -> bool:
-        """
-        Detect a fall based on torso angles and velocity.
-
-        Args:
-            landmarks: List of (x, y, confidence) for each keypoint.
-
-        Returns:
-            True if a fall is detected, False otherwise.
-        """
-        # Validate landmarks length (expecting at least 33 keypoints)
-        if not landmarks or len(landmarks) < 33:
+    def detect_fall(self, landmarks: Sequence[Landmark]) -> bool:
+        """Feed one frame. Returns True on the frame a fall is confirmed."""
+        if not landmarks or not self.has_reliable_key_points(landmarks):
             self.reset()
             return False
 
-        # Check confidence of critical landmarks
-        for idx in [self.LEFT_SHOULDER, self.RIGHT_SHOULDER, self.LEFT_HIP, self.RIGHT_HIP]:
-            if len(landmarks[idx]) < 3 or landmarks[idx][2] < self.MIN_LANDMARK_CONFIDENCE:
-                # Reset if key landmarks are not reliable
-                self.reset()
-                return False
+        t = self.thresholds
+        tilt = torso_tilt_deg(landmarks)
+        speed = self._speed_px(landmarks)
 
-        # Extract (x, y) coordinates only, discard confidence
-        coords = [(lm[0], lm[1]) for lm in landmarks]
+        is_falling = tilt > t.tilt_threshold_deg and speed > t.velocity_threshold_px
+        is_lying = tilt > t.tilt_threshold_deg + t.lying_margin_deg
 
-        # Compute torso angles and velocity
-        angle_v, angle_h = self._calculate_torso_angle(coords)
-        velocity = self._calculate_velocity(coords)
-
-        # Determine if subject is actively falling
-        is_falling = (
-            angle_v > self.TORSO_ANGLE_THRESHOLD_VERTICAL or angle_h > self.TORSO_ANGLE_THRESHOLD_HORIZONTAL
-        ) and velocity > self.VELOCITY_THRESHOLD
-
-        # Determine if subject is lying on the ground
-        is_lying = (
-            angle_v > self.TORSO_ANGLE_THRESHOLD_VERTICAL + 10
-            or angle_h > self.TORSO_ANGLE_THRESHOLD_HORIZONTAL + 10
-        )
-
-        # Update internal counters based on current state
         if is_falling:
-            self.consecutive_frames_fallen += 1
-            self.frames_in_fall_state = 0
+            self.frames_falling += 1
+            self.frames_lying = 0
         elif is_lying:
-            self.consecutive_frames_fallen = 0
-            self.frames_in_fall_state += 1
+            self.frames_falling = 0
+            self.frames_lying += 1
         else:
-            self.consecutive_frames_fallen = 0
-            self.frames_in_fall_state = 0
+            self.frames_falling = 0
+            self.frames_lying = 0
 
-        # Check thresholds to confirm fall
-        is_fall_detected = (
-            self.consecutive_frames_fallen >= self.FALL_DURATION_THRESHOLD
-            or self.frames_in_fall_state >= self.FALL_STATE_DURATION_THRESHOLD
-        )
-
-        if is_fall_detected:
-            # Reset after confirming fall to avoid repeated detection
-            self.reset()
-
-        return is_fall_detected
+        confirmed = self.frames_falling >= t.falling_frames or self.frames_lying >= t.lying_frames
+        if confirmed:
+            self.reset()  # avoid firing again on the very next frame
+        return confirmed

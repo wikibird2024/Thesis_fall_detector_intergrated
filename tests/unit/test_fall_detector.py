@@ -2,12 +2,33 @@
 
 import pytest
 
-from builders import lying, standing
-from fall_detector.fall.fall_detector import FallDetector
+from builders import lying, standing, tilted
+from fall_detector.fall.fall_detector import FallDetector, FallThresholds, torso_tilt_deg
 
 
 def run_frames(detector: FallDetector, frames: list) -> list[bool]:
     return [detector.detect_fall(landmarks) for landmarks in frames]
+
+
+# ---------------------------------------------------------------- geometry
+
+
+@pytest.mark.parametrize(
+    ("landmarks", "expected_deg"),
+    [
+        (standing(), 0.0),
+        (lying(), 90.0),
+        (tilted(45), 45.0),
+        (tilted(-45), 45.0),  # leaning left or right is the same tilt
+        (tilted(180), 180.0),  # upside down
+    ],
+    ids=["standing", "lying", "lean-right", "lean-left", "upside-down"],
+)
+def test_torso_tilt(landmarks, expected_deg):
+    assert torso_tilt_deg(landmarks) == pytest.approx(expected_deg, abs=0.01)
+
+
+# ---------------------------------------------------------------- invalid input
 
 
 def test_no_landmarks_is_not_a_fall():
@@ -20,30 +41,57 @@ def test_too_few_landmarks_is_not_a_fall():
 
 def test_low_visibility_key_points_never_confirm_a_fall():
     detector = FallDetector()
-    results = run_frames(detector, [lying(visibility=0.1)] * 10)
-    assert not any(results)
+    assert not any(run_frames(detector, [lying(visibility=0.1)] * 10))
 
 
-def test_person_standing_still_is_not_a_fall():
+def test_depth_value_does_not_affect_reliability():
+    # Regression (bug A): z (depth) used to be read as confidence.
     detector = FallDetector()
-    assert not any(run_frames(detector, [standing()] * 20))
+    assert detector.has_reliable_key_points(lying(depth=-0.8))
+    assert not detector.has_reliable_key_points(lying(depth=0.9, visibility=0.1))
 
 
-@pytest.mark.xfail(strict=True, reason="bug A: confidence check reads z (depth) instead of visibility")
-def test_lying_person_is_confirmed_as_fall_after_state_duration():
+# ---------------------------------------------------------------- decisions
+
+
+@pytest.mark.parametrize("depth", [-0.3, 0.0, 0.9])
+def test_person_standing_still_is_not_a_fall(depth):
+    # Regression (bug B): upright torso used to measure 180 deg and count as lying.
     detector = FallDetector()
-    results = run_frames(detector, [lying()] * 5)
-    assert results[-1] is True
+    assert not any(run_frames(detector, [standing(depth=depth)] * 20))
 
 
-@pytest.mark.xfail(strict=True, reason="bug B: upright torso gives angle 180 and counts as lying")
-def test_standing_still_with_high_depth_value_is_not_a_fall():
-    # depth=0.9 makes the (buggy) confidence check pass, exposing the angle bug.
+def test_slight_lean_is_not_a_fall():
     detector = FallDetector()
-    assert not any(run_frames(detector, [standing(depth=0.9)] * 20))
+    assert not any(run_frames(detector, [tilted(30)] * 20))
 
 
-@pytest.mark.xfail(strict=True, reason="`value or default` replaces an explicit 0 with the default")
+def test_lying_person_is_confirmed_on_the_fifth_frame():
+    detector = FallDetector()
+    assert run_frames(detector, [lying()] * 5) == [False, False, False, False, True]
+
+
+def test_fast_fall_is_confirmed_by_motion():
+    # Tilted past 60 deg (not enough to count as lying) while moving 10 px per frame.
+    detector = FallDetector(FallThresholds(falling_frames=3))
+    frames = [tilted(65, hip=(300 + 10 * i, 300)) for i in range(4)]
+    # Frame 1 has no previous position, so speed is 0; frames 2-4 are moving.
+    assert run_frames(detector, frames) == [False, False, False, True]
+
+
+def test_getting_up_resets_the_count():
+    detector = FallDetector()
+    frames = [lying()] * 4 + [standing()] + [lying()] * 4
+    assert not any(run_frames(detector, frames))
+
+
+def test_fall_fires_once_then_counting_starts_again():
+    detector = FallDetector()
+    results = run_frames(detector, [lying()] * 10)
+    assert results.count(True) == 2  # frame 5 and frame 10
+
+
 def test_explicit_zero_threshold_is_kept():
-    detector = FallDetector(velocity_threshold=0.0)
-    assert detector.VELOCITY_THRESHOLD == 0.0
+    # Regression: `value or default` used to replace 0 with the default.
+    thresholds = FallThresholds(velocity_threshold_px=0.0)
+    assert FallDetector(thresholds).thresholds.velocity_threshold_px == 0.0
