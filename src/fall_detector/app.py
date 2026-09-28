@@ -26,6 +26,7 @@ from fall_detector.alerts.dispatcher import AlertDispatcher
 from fall_detector.inputs.mqtt_client import MQTTClient
 from fall_detector.inputs.video_source import VideoSource, find_and_connect_source
 from fall_detector.observability import metrics
+from fall_detector.observability.health import HealthServer
 from fall_detector.processing.camera_pipeline import CameraPipeline
 from fall_detector.processing.detection_processor import DetectionProcessor
 from fall_detector.runtime.supervisor import TaskSupervisor
@@ -158,6 +159,9 @@ class Application:
                 reconnect_delay_s=c.reconnect_delay_s,
                 max_failed_reads=c.max_failed_reads,
             )
+        self.health: HealthServer | None = None
+        if settings.health.enabled:
+            self.health = HealthServer(self.status, settings.health.host, settings.health.port)
         self._stop_requested = asyncio.Event()
         self.started_at = time.monotonic()
 
@@ -189,6 +193,12 @@ class Application:
         if self.pipeline is not None:
             self.supervisor.start("camera", self.pipeline.run, restart_on_exit=False)
         self.supervisor.start("heartbeat", self._heartbeat)
+        if self.health is not None:
+            try:
+                await self.health.start()
+            except OSError as error:  # port in use: detection matters more than the endpoint
+                logger.error("Health server not started on port %d: %s", self.health.port, error)
+                self.health = None
         logger.info(
             "Fall detector running (camera=%s, mqtt=%s)", self.pipeline is not None, c.mqtt_client is not None
         )
@@ -199,6 +209,8 @@ class Application:
         await self.dispatcher.drain(self.settings.alerts.shutdown_drain_s)  # 2. finish queued alerts
         await self.supervisor.stop()  # 3. everything else
         await self.dispatcher.close()  # 4. close channels
+        if self.health is not None:
+            await self.health.stop()
         if self.components.analyzer is not None:
             with contextlib.suppress(Exception):
                 self.components.analyzer.close()

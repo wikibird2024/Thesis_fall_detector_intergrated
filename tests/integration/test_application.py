@@ -27,6 +27,7 @@ def test_settings(**overrides) -> Settings:
         "camera": {"show_window": False, "reconnect_delay_s": 0.01},
         "fall": {"lying_frames": 3},
         "alerts": {"retry_base_delay_s": 0, "shutdown_drain_s": 2},
+        "health": {"enabled": False},
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
