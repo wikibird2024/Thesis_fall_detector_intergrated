@@ -1,10 +1,11 @@
-
+import asyncio
 import io
+
 import cv2
 import numpy as np
-import asyncio
 from telegram import Bot
-from telegram.error import TelegramError, RetryAfter, TimedOut, NetworkError
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
+
 
 class TelegramBot:
     """
@@ -32,7 +33,7 @@ class TelegramBot:
                 await self.bot.send_message(chat_id=self.chat_id, text=text)
                 return
             except (RetryAfter, TimedOut, NetworkError) as e:
-                print(f"[TELEGRAM] ⚠️ Attempt {attempt+1} failed: {e}, retrying...")
+                print(f"[TELEGRAM] ⚠️ Attempt {attempt + 1} failed: {e}, retrying...")
                 await asyncio.sleep(delay)
             except TelegramError as e:
                 print(f"[TELEGRAM] ❌ TelegramError: {e}")
@@ -64,7 +65,7 @@ class TelegramBot:
                 photo_bytes.close()
                 return
             except (RetryAfter, TimedOut, NetworkError) as e:
-                print(f"[TELEGRAM] ⚠️ Attempt {attempt+1} failed: {e}, retrying...")
+                print(f"[TELEGRAM] ⚠️ Attempt {attempt + 1} failed: {e}, retrying...")
                 await asyncio.sleep(delay)
             except TelegramError as e:
                 print(f"[TELEGRAM] ❌ TelegramError: {e}")

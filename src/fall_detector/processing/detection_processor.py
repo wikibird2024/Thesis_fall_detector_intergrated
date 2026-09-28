@@ -1,21 +1,22 @@
+import asyncio
+import json
+import logging
+from datetime import datetime, timedelta
+from typing import Any
+
 import cv2
 import numpy as np
-from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
-import asyncio
-import logging
-import json
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 
-from telegram.error import TelegramError, RetryAfter, TimedOut, NetworkError
-from fall.fall_detector import FallDetector
-from comm.ami_trigger import AMITrigger
-from comm.telegram_bot import TelegramBot
-from database.database_manager import insert_fall_event
-from utils.draw_utils import draw_person
-from config.config import ALERT_COOLDOWN_MINUTES
+from fall_detector.alerts.ami_trigger import AMITrigger
+from fall_detector.alerts.telegram_bot import TelegramBot
+from fall_detector.fall.fall_detector import FallDetector
+from fall_detector.settings import ALERT_COOLDOWN_MINUTES
+from fall_detector.storage.database_manager import insert_fall_event
+from fall_detector.vision.drawing import draw_person
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # Limit concurrent Telegram requests
@@ -23,17 +24,17 @@ telegram_semaphore = asyncio.Semaphore(5)
 
 
 class DetectionProcessor:
-    def __init__(self, ami_trigger: AMITrigger, telegram_bot: Optional[TelegramBot]):
-        self.fall_detectors: Dict[str, FallDetector] = {}
-        self.last_alert_timestamps: Dict[str, datetime] = {}
-        self.last_fall_timestamps: Dict[str, float] = {}
-        self.entity_last_seen: Dict[str, datetime] = {}
+    def __init__(self, ami_trigger: AMITrigger, telegram_bot: TelegramBot | None):
+        self.fall_detectors: dict[str, FallDetector] = {}
+        self.last_alert_timestamps: dict[str, datetime] = {}
+        self.last_fall_timestamps: dict[str, float] = {}
+        self.entity_last_seen: dict[str, datetime] = {}
 
         self.ami_trigger = ami_trigger
         self.telegram_bot = telegram_bot
         self.cooldown_minutes = ALERT_COOLDOWN_MINUTES
 
-    async def handle_camera_data(self, frame: Optional[np.ndarray], person_id: int, box: list, landmarks: list):
+    async def handle_camera_data(self, frame: np.ndarray | None, person_id: int, box: list, landmarks: list):
         """Process camera frame, detect falls, and send alerts if needed."""
         entity_id = f"camera_person_{person_id}"
         self.entity_last_seen[entity_id] = datetime.now()
@@ -45,9 +46,11 @@ class DetectionProcessor:
             draw_person(frame, box, landmarks, entity_id, status)
 
         # Camera chỉ dùng cooldown (event_ts=None)
-        if is_fall and self._can_alert(entity_id): 
+        if is_fall and self._can_alert(entity_id):
             # Dùng timestamp hiện tại vì không có GPS/Device time
-            fall_event = self._create_fall_event("camera", entity_id, latitude=0, longitude=0, has_gps_fix=False) 
+            fall_event = self._create_fall_event(
+                "camera", entity_id, latitude=0, longitude=0, has_gps_fix=False
+            )
             fall_id = await self._insert_fall_event_with_retry(fall_event)
             if fall_id is None:
                 return
@@ -76,16 +79,18 @@ class DetectionProcessor:
         device_id = mqtt_msg.get("device_id")
         fall_detected = mqtt_msg.get("fall_detected")
         # ✅ Lấy timestamp từ MQTT để deduplication
-        event_ts = mqtt_msg.get("timestamp") 
+        event_ts = mqtt_msg.get("timestamp")
 
         if not device_id or fall_detected is not True or not isinstance(event_ts, (int, float)):
-            logger.debug(f"[MQTT] Skipping message: Required fields (device_id, fall_detected=True, timestamp) missing/invalid.")
+            logger.debug(
+                "[MQTT] Skipping message: Required fields (device_id, fall_detected=True, timestamp) missing/invalid."
+            )
             return
 
         latitude = mqtt_msg.get("latitude")
         longitude = mqtt_msg.get("longitude")
         has_gps_fix = mqtt_msg.get("has_gps_fix", False)
-        
+
         # Validate GPS coordinates (giữ nguyên logic kiểm tra range)
         if latitude is not None and longitude is not None:
             if not (isinstance(latitude, (int, float)) and isinstance(longitude, (int, float))):
@@ -103,7 +108,9 @@ class DetectionProcessor:
         # ✅ DEDUP: Sử dụng timestamp của event_ts từ thiết bị để check lặp
         if self._can_alert(device_id, event_ts=event_ts):
             # Pass event_ts vào _create_fall_event để đảm bảo timestamp DB chính xác
-            fall_event = self._create_fall_event("esp32", device_id, latitude, longitude, has_gps_fix, event_ts) 
+            fall_event = self._create_fall_event(
+                "esp32", device_id, latitude, longitude, has_gps_fix, event_ts
+            )
             fall_id = await self._insert_fall_event_with_retry(fall_event)
             if fall_id is None:
                 logger.error(f"[MQTT] Failed to insert fall event for device {device_id}")
@@ -117,14 +124,14 @@ class DetectionProcessor:
         else:
             logger.debug(f"[MQTT] Skipping alert for {device_id} (Deduplication or Cooldown active).")
 
-    async def _send_alerts(self, msg: str, frame: Optional[np.ndarray] = None):
+    async def _send_alerts(self, msg: str, frame: np.ndarray | None = None):
         """
         Centralized alert sending to AMI and Telegram.
         Sử dụng asyncio.create_task để gửi cảnh báo song song.
         """
         ami_task = asyncio.create_task(self._send_ami_alert(msg), name="ami_alert")
         telegram_task = asyncio.create_task(self._send_telegram_alert(msg, frame), name="telegram_alert")
-        
+
         # Chờ cả hai hoàn thành, không để lỗi chặn nhau
         await asyncio.gather(ami_task, telegram_task, return_exceptions=True)
 
@@ -136,7 +143,7 @@ class DetectionProcessor:
         except Exception as e:
             logger.error(f"[ALERT] Failed AMI send: {e}")
 
-    async def _send_telegram_alert(self, msg: str, frame: Optional[np.ndarray]):
+    async def _send_telegram_alert(self, msg: str, frame: np.ndarray | None):
         """Helper to send Telegram alert with safe retry logic."""
         try:
             await self._safe_send_telegram(frame, msg)
@@ -144,7 +151,9 @@ class DetectionProcessor:
         except Exception as e:
             logger.error(f"[ALERT] Failed Telegram send: {e}")
 
-    async def _safe_send_telegram(self, frame: Optional[np.ndarray], msg: str, retries: int = 3, delay: float = 2.0):
+    async def _safe_send_telegram(
+        self, frame: np.ndarray | None, msg: str, retries: int = 3, delay: float = 2.0
+    ):
         """Safely send Telegram message/photo with retries and fallback."""
         if not self.telegram_bot:
             logger.warning("[TELEGRAM] Bot not initialized, skipping")
@@ -161,13 +170,13 @@ class DetectionProcessor:
                     return
                 except (RetryAfter, TimedOut, NetworkError) as e:
                     logger.warning(f"[TELEGRAM] Network issue (attempt {attempt + 1}): {e}")
-                    await asyncio.sleep(delay * (2 ** attempt))
+                    await asyncio.sleep(delay * (2**attempt))
                 except TelegramError as e:
                     logger.error(f"[TELEGRAM] Error (attempt {attempt + 1}): {e}")
-                    await asyncio.sleep(delay * (2 ** attempt))
+                    await asyncio.sleep(delay * (2**attempt))
                 except Exception as e:
                     logger.error(f"[TELEGRAM] Unexpected error (attempt {attempt + 1}): {e}")
-                    await asyncio.sleep(delay * (2 ** attempt))
+                    await asyncio.sleep(delay * (2**attempt))
 
             logger.warning("[TELEGRAM] All retries failed, sending text fallback")
             try:
@@ -175,13 +184,10 @@ class DetectionProcessor:
             except Exception as e:
                 logger.error(f"[TELEGRAM] Fallback failed: {e}")
 
-    def _is_valid_frame(self, frame: Optional[np.ndarray]) -> bool:
+    def _is_valid_frame(self, frame: np.ndarray | None) -> bool:
         """Check if frame is valid for sending."""
         return (
-            isinstance(frame, np.ndarray)
-            and frame.size > 0
-            and frame.shape[0] >= 10
-            and frame.shape[1] >= 10
+            isinstance(frame, np.ndarray) and frame.size > 0 and frame.shape[0] >= 10 and frame.shape[1] >= 10
         )
 
     def _resize_and_compress_frame(self, frame: np.ndarray) -> np.ndarray:
@@ -196,7 +202,15 @@ class DetectionProcessor:
             return cv2.imdecode(img_encoded, cv2.IMREAD_COLOR)
         return frame
 
-    def _create_fall_event(self, source: str, entity_id: str, latitude: float, longitude: float, has_gps_fix: bool, timestamp: Optional[float] = None) -> Dict[str, Any]:
+    def _create_fall_event(
+        self,
+        source: str,
+        entity_id: str,
+        latitude: float,
+        longitude: float,
+        has_gps_fix: bool,
+        timestamp: float | None = None,
+    ) -> dict[str, Any]:
         """Create a fall event dict."""
         return {
             "timestamp": timestamp if timestamp is not None else datetime.now().timestamp(),
@@ -208,7 +222,7 @@ class DetectionProcessor:
             "has_gps_fix": has_gps_fix,
         }
 
-    async def _insert_fall_event_with_retry(self, event: Dict[str, Any], retries: int = 3) -> Optional[int]:
+    async def _insert_fall_event_with_retry(self, event: dict[str, Any], retries: int = 3) -> int | None:
         """Insert fall event with retries in a thread to avoid blocking the event loop."""
         for attempt in range(retries):
             try:
@@ -218,7 +232,7 @@ class DetectionProcessor:
             except Exception as e:
                 logger.warning(f"[DB] Insert failed (attempt {attempt + 1}): {e}")
                 # Exponential backoff
-                await asyncio.sleep(1 * (2 ** attempt))
+                await asyncio.sleep(1 * (2**attempt))
         logger.error("[DB] All insert retries failed")
         return None
 
@@ -228,7 +242,7 @@ class DetectionProcessor:
             self.fall_detectors[entity_id] = FallDetector()
         return self.fall_detectors[entity_id]
 
-    def _can_alert(self, entity_id: str, event_ts: Optional[float] = None) -> bool:
+    def _can_alert(self, entity_id: str, event_ts: float | None = None) -> bool:
         """
         Check if alert cooldown has passed AND (cho nguồn MQTT) event timestamp is new.
         - event_ts=None: Camera/Sensor local (chỉ check cooldown).
@@ -247,19 +261,22 @@ class DetectionProcessor:
         # 2. Cooldown check (áp dụng cho tất cả các nguồn)
         now = datetime.now()
         last_alert = self.last_alert_timestamps.get(entity_id)
-        
-        is_cooldown_expired = last_alert is None or (now - last_alert) > timedelta(minutes=self.cooldown_minutes)
-        
+
+        is_cooldown_expired = last_alert is None or (now - last_alert) > timedelta(
+            minutes=self.cooldown_minutes
+        )
+
         if not is_cooldown_expired:
             logger.debug(f"[COOLDOWN] Blocking alert for {entity_id}: Cooldown active.")
-        
+
         return is_cooldown_expired
 
     def evict_stale_detectors(self, max_age_seconds: float = 30.0):
         """Remove state for entities not seen within max_age_seconds."""
         now = datetime.now()
         stale = [
-            eid for eid, last in self.entity_last_seen.items()
+            eid
+            for eid, last in self.entity_last_seen.items()
             if (now - last).total_seconds() > max_age_seconds
         ]
         for eid in stale:

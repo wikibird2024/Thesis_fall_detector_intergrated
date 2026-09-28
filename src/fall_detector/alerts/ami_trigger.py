@@ -1,16 +1,14 @@
-
-
 import asyncio
-from panoramisk.manager import Manager
 import logging
-from typing import List, Dict, Union
+
+from panoramisk.manager import Manager
 
 # Import configuration từ file config
-from config.config import EXTENSIONS, ALERT_MESSAGE, CALLER_ID
+from fall_detector.settings import ALERT_MESSAGE, CALLER_ID, EXTENSIONS
 
 # Setup logging
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 
 
 class AMITrigger:
@@ -28,7 +26,7 @@ class AMITrigger:
         self.is_connected = False
 
         # Track last call status per extension
-        self._last_call_status: Dict[str, str] = {}
+        self._last_call_status: dict[str, str] = {}
 
     async def connect(self):
         """Connect to AMI asynchronously."""
@@ -74,10 +72,7 @@ class AMITrigger:
 
     async def _handle_extension(self, extension: str, message: str):
         """Send call and message to a single extension concurrently."""
-        await asyncio.gather(
-            self._originate_call(extension, message),
-            self._send_message(extension, message)
-        )
+        await asyncio.gather(self._originate_call(extension, message), self._send_message(extension, message))
 
     async def _originate_call(self, extension: str, message: str) -> bool:
         """
@@ -89,29 +84,35 @@ class AMITrigger:
             return False
 
         try:
-            response: Union[dict, list] = await self.manager.send_action({
-                "Action": "Originate",
-                "Channel": f"PJSIP/{extension}",
-                "Context": "internal",
-                "Exten": "9999",           # Hangup point trong extensions.ael
-                "Priority": 1,
-                "CallerID": self.caller_id,
-                "Variable": f"ALERT_MSG={message}",
-                "Async": "true",
-            })
+            response: dict | list = await self.manager.send_action(
+                {
+                    "Action": "Originate",
+                    "Channel": f"PJSIP/{extension}",
+                    "Context": "internal",
+                    "Exten": "9999",  # Hangup point trong extensions.ael
+                    "Priority": 1,
+                    "CallerID": self.caller_id,
+                    "Variable": f"ALERT_MSG={message}",
+                    "Async": "true",
+                }
+            )
 
             # Nếu trả về list of Messages, kiểm tra từng message
             if isinstance(response, list):
-                success_msgs = [msg for msg in response if getattr(msg, 'Response', '').lower() == 'success']
-                failure_msgs = [msg for msg in response if getattr(msg, 'Response', '').lower() == 'failure']
+                success_msgs = [msg for msg in response if getattr(msg, "Response", "").lower() == "success"]
+                failure_msgs = [msg for msg in response if getattr(msg, "Response", "").lower() == "failure"]
 
                 if success_msgs:
-                    self._last_call_status[extension] = 'Success'
-                    logger.info(f"[📞 CALL] → {extension} | Originate queued successfully ({len(success_msgs)} success)")
+                    self._last_call_status[extension] = "Success"
+                    logger.info(
+                        f"[📞 CALL] → {extension} | Originate queued successfully ({len(success_msgs)} success)"
+                    )
                     return True
                 else:
-                    self._last_call_status[extension] = 'Failure'
-                    logger.warning(f"[📞 CALL] → {extension} | All originate messages failed ({len(failure_msgs)} failure)")
+                    self._last_call_status[extension] = "Failure"
+                    logger.warning(
+                        f"[📞 CALL] → {extension} | All originate messages failed ({len(failure_msgs)} failure)"
+                    )
                     return False
 
             # Nếu dict (trường hợp cũ)
@@ -138,12 +139,9 @@ class AMITrigger:
             return False
 
         try:
-            response = await self.manager.send_action({
-                "Action": "MessageSend",
-                "To": f"pjsip:{extension}",
-                "From": "server",
-                "Body": message
-            })
+            response = await self.manager.send_action(
+                {"Action": "MessageSend", "To": f"pjsip:{extension}", "From": "server", "Body": message}
+            )
             status = response.get("Response", "Unknown")
             msg = response.get("Message", "")
             logger.info(f"[📨 SMS] → {extension} | Status: {status} - {msg}")
@@ -169,4 +167,3 @@ class AMITrigger:
 #     await ami.close()
 #
 # asyncio.run(main())
-

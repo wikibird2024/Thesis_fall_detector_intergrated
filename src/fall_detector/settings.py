@@ -1,25 +1,26 @@
-
 import os
+
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # ==============================
 # FallDetector thresholds
 # ==============================
-TORSO_ANGLE_THRESHOLD_VERTICAL: float = 60.0      # Maximum torso tilt (degrees) to consider upright
-TORSO_ANGLE_THRESHOLD_HORIZONTAL: float = 45.0    # Maximum torso tilt (degrees) sideways to consider upright
-VELOCITY_THRESHOLD: float = 0.5                    # Minimum torso velocity (units/frame) to detect falling
-FALL_DURATION_THRESHOLD: int = 5                   # Consecutive frames exceeding fall criteria to confirm fall
-FALL_STATE_DURATION_THRESHOLD: int = 5             # Frames lying down to confirm fall state
-MIN_LANDMARK_CONFIDENCE: float = 0.5               # Minimum confidence for key landmarks (shoulders, hips)
+TORSO_ANGLE_THRESHOLD_VERTICAL: float = 60.0  # Maximum torso tilt (degrees) to consider upright
+TORSO_ANGLE_THRESHOLD_HORIZONTAL: float = 45.0  # Maximum torso tilt (degrees) sideways to consider upright
+VELOCITY_THRESHOLD: float = 0.5  # Minimum torso velocity (units/frame) to detect falling
+FALL_DURATION_THRESHOLD: int = 5  # Consecutive frames exceeding fall criteria to confirm fall
+FALL_STATE_DURATION_THRESHOLD: int = 5  # Frames lying down to confirm fall state
+MIN_LANDMARK_CONFIDENCE: float = 0.5  # Minimum confidence for key landmarks (shoulders, hips)
 
 # ==============================
 # MQTT Configuration
 # ==============================
 MQTT_BROKER_HOST = "io.adafruit.com"
 MQTT_BROKER_PORT = 1883
-MQTT_USERNAME = os.getenv("MQTT_USERNAME")        # bí mật -> .env
-MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")        # bí mật -> .env
+MQTT_USERNAME = os.getenv("MQTT_USERNAME")  # bí mật -> .env
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")  # bí mật -> .env
 MQTT_TOPIC = "tranhao/feeds/fall_alert"
 MQTT_KEEPALIVE = 60
 ENABLE_MQTT = True
@@ -29,7 +30,8 @@ ENABLE_MQTT = True
 # ==============================
 ENABLE_TELEGRAM = True
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # bí mật -> .env
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")      # bí mật -> .env
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # bí mật -> .env
+
 
 # ==============================
 # Video Sources (centralized configuration)
@@ -43,18 +45,19 @@ def get_video_sources():
     4. Alternative external webcam (index 1).
     """
     sources = []
-    
+
     # Check for ESP32-CAM stream URL
     stream_url = os.getenv("VIDEO_STREAM_URL")
     if stream_url:
         sources.append(stream_url)
-    
+
     # Add prioritized webcam indices
     sources.append(2)  # External webcam
     sources.append(0)  # Laptop's default webcam
     sources.append(1)  # Alternative external webcam fallback
 
     return sources
+
 
 # ==============================
 # Debug / Logging
@@ -91,11 +94,11 @@ SKELETON_POINT_RADIUS = 5
 # ==============================
 AMI_HOST = "127.0.0.1"
 AMI_PORT = 5038
-AMI_USERNAME = os.getenv("AMI_USERNAME")      # bí mật -> .env
-AMI_SECRET = os.getenv("AMI_SECRET")          # bí mật -> .env
+AMI_USERNAME = os.getenv("AMI_USERNAME")  # bí mật -> .env
+AMI_SECRET = os.getenv("AMI_SECRET")  # bí mật -> .env
 ENABLE_AMI = True
 
-EXTENSIONS = ['6001', '6002', '6004']
+EXTENSIONS = ["6001", "6002", "6004"]
 ALERT_MESSAGE = "Fall detected! Please check immediately."
 CALLER_ID = "FallAlertSystem <1000>"
 
@@ -103,7 +106,7 @@ CALLER_ID = "FallAlertSystem <1000>"
 # Optional AMI REST API
 # ==============================
 AMI_API_ENDPOINT = "http://your-ami-api-endpoint"
-AMI_API_KEY = os.getenv("AMI_API_KEY")        # bí mật -> .env
+AMI_API_KEY = os.getenv("AMI_API_KEY")  # bí mật -> .env
 
 # ==============================
 # Alert cooldown
@@ -130,7 +133,4 @@ def validate_config():
         if not AMI_SECRET:
             errors.append("AMI_SECRET required when ENABLE_AMI=True")
     if errors:
-        raise EnvironmentError(
-            "Missing required environment variables:\n" +
-            "\n".join(f"  - {e}" for e in errors)
-        )
+        raise OSError("Missing required environment variables:\n" + "\n".join(f"  - {e}" for e in errors))

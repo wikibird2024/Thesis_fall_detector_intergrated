@@ -121,3 +121,9 @@ cython_debug/
 .pdm-build/
 .pixi/
 __pypackages__/
+
+# Model weights and runtime data (never commit)
+*.pt
+*.onnx
+*.engine
+data/

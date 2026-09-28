@@ -1,6 +1,3 @@
-import numpy as np
-
-
 class PersonTracker:
     def __init__(self, iou_threshold=0.3):
         self.next_id = 0

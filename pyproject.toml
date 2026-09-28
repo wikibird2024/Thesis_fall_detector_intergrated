@@ -1,0 +1,110 @@
+# Single source of truth for packaging, dependencies and tool settings.
+# Install for development:   pip install -e ".[vision,dev]"
+# Install for CI (no GPU/ML): pip install -e ".[dev]"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fall-detector"
+version = "2.0.0"
+description = "Real-time fall detection from camera and wearable (MQTT) sources, with Telegram and Asterisk alerts."
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+authors = [{ name = "TranHao" }]
+license = { text = "Proprietary" }
+
+# Core runtime: everything except the heavy ML stack.
+# Ranges allow patch/minor updates; exact versions live in requirements.lock.txt.
+dependencies = [
+    "numpy>=1.24,<2",                 # mediapipe 0.10.21 and torch 2.1 need numpy 1.x
+    "opencv-python-headless>=4.8,<5",
+    "aiomqtt>=2.3,<3",
+    "panoramisk==1.4",
+    "python-telegram-bot>=21,<22",
+    "pandas>=2.0,<2.3",
+    "python-dotenv>=1.0",
+    "requests>=2.31,<3",
+]
+
+[project.optional-dependencies]
+# Vision models: large downloads, not needed to run the unit tests.
+vision = [
+    "torch==2.1.1",
+    "torchvision==0.16.1",
+    "ultralytics==8.1.25",
+    "mediapipe==0.10.21",
+]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "pre-commit>=3.7",
+    "types-requests",
+]
+
+[project.scripts]
+fall-detector = "fall_detector.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+src = ["src", "tests"]
+extend-exclude = ["scripts/manual"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes: unused names, undefined names
+    "I",        # import order
+    "B",        # bugbear: likely bugs
+    "UP",       # pyupgrade: modern syntax
+    "SIM",      # simplifications
+    "ASYNC",    # blocking calls inside async code
+    "RUF",      # ruff-specific checks
+    "LOG",      # logging mistakes
+]
+ignore = [
+    "RUF001", "RUF002", "RUF003",  # allow Vietnamese text and emoji in strings/comments
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["fall_detector"]
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
+markers = [
+    "vision: needs the [vision] extra (torch, ultralytics, mediapipe)",
+]
+
+# ---------------------------------------------------------------- coverage
+[tool.coverage.run]
+source = ["fall_detector"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+# ---------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.10"
+files = ["src"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = ["cv2.*", "mediapipe.*", "ultralytics.*", "panoramisk.*", "pandas.*"]
+ignore_missing_imports = true

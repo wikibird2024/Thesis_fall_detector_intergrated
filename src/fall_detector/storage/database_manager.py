@@ -1,7 +1,7 @@
-
 import sqlite3
-import pandas as pd
 from datetime import datetime
+
+import pandas as pd
 
 DATABASE_FILE = "fall_events.db"
 
@@ -47,15 +47,19 @@ def insert_fall_event(json_data):
     conn = create_connection()
     if conn:
         try:
-            df = pd.DataFrame([{
-                "timestamp": datetime.fromtimestamp(json_data.get("timestamp", 0)).isoformat(),
-                "device_id": json_data.get("device_id"),
-                "fall_detected": int(json_data.get("fall_detected", False)),
-                "latitude": json_data.get("latitude"),
-                "longitude": json_data.get("longitude"),
-                "has_gps_fix": int(json_data.get("has_gps_fix", False)),
-                "status": "pending"
-            }])
+            df = pd.DataFrame(
+                [
+                    {
+                        "timestamp": datetime.fromtimestamp(json_data.get("timestamp", 0)).isoformat(),
+                        "device_id": json_data.get("device_id"),
+                        "fall_detected": int(json_data.get("fall_detected", False)),
+                        "latitude": json_data.get("latitude"),
+                        "longitude": json_data.get("longitude"),
+                        "has_gps_fix": int(json_data.get("has_gps_fix", False)),
+                        "status": "pending",
+                    }
+                ]
+            )
             df.to_sql("fall_events", conn, if_exists="append", index=False)
             # Get last inserted row id
             last_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -73,10 +77,7 @@ def update_alert_status(event_id, new_status):
     conn = create_connection()
     if conn:
         try:
-            conn.execute(
-                "UPDATE fall_events SET status = ? WHERE id = ?;",
-                (new_status, event_id)
-            )
+            conn.execute("UPDATE fall_events SET status = ? WHERE id = ?;", (new_status, event_id))
             conn.commit()
             print(f"[DB] Alert ID {event_id} status updated to '{new_status}'.")
         except sqlite3.Error as e:
@@ -93,7 +94,7 @@ def get_all_alerts():
             df = pd.read_sql(
                 "SELECT id, timestamp, device_id, fall_detected, latitude, longitude, has_gps_fix, status "
                 "FROM fall_events ORDER BY timestamp DESC;",
-                conn
+                conn,
             )
             return df
         except Exception as e:

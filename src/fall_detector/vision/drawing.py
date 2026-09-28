@@ -1,29 +1,29 @@
-
 import cv2
-import numpy as np
 import mediapipe as mp
-from config.config import (
+
+from fall_detector.settings import (
     BOUNDING_BOX_COLOR,
     BOUNDING_BOX_THICKNESS,
     SKELETON_LINE_COLOR,
     SKELETON_LINE_THICKNESS,
     SKELETON_POINT_COLOR,
-    SKELETON_POINT_RADIUS
+    SKELETON_POINT_RADIUS,
 )
 
 mp_pose = mp.solutions.pose
 POSE_CONNECTIONS = mp_pose.POSE_CONNECTIONS
 
 
-def draw_bounding_box(frame, box, person_id, status,
-                      color=BOUNDING_BOX_COLOR, thickness=BOUNDING_BOX_THICKNESS):
+def draw_bounding_box(
+    frame, box, person_id, status, color=BOUNDING_BOX_COLOR, thickness=BOUNDING_BOX_THICKNESS
+):
     """
     Draws a bounding box with an ID and status label, changing color based on status.
     """
     x1, y1, x2, y2, conf, cls_id = box
 
     # Choose color based on status
-    if status == 'fall':
+    if status == "fall":
         box_color = (0, 0, 255)  # Red for fall
     else:
         box_color = (0, 255, 0)  # Green for normal/default
@@ -43,9 +43,15 @@ def draw_bounding_box(frame, box, person_id, status,
     )
 
 
-def draw_skeleton(frame, landmarks, visibility_th=0.5,
-                  line_color=SKELETON_LINE_COLOR, line_thickness=SKELETON_LINE_THICKNESS,
-                  point_color=SKELETON_POINT_COLOR, point_radius=SKELETON_POINT_RADIUS):
+def draw_skeleton(
+    frame,
+    landmarks,
+    visibility_th=0.5,
+    line_color=SKELETON_LINE_COLOR,
+    line_thickness=SKELETON_LINE_THICKNESS,
+    point_color=SKELETON_POINT_COLOR,
+    point_radius=SKELETON_POINT_RADIUS,
+):
     """
     Draws a person's skeleton based on a list of landmarks in the format [x, y, z, visibility].
     """

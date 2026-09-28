@@ -1,7 +1,7 @@
 
 # test_mqtt.py
 import asyncio
-from comm.mqtt_client import MQTTClient  # import class bạn đã viết
+from fall_detector.inputs.mqtt_client import MQTTClient  # import class bạn đã viết
 
 
 async def main():

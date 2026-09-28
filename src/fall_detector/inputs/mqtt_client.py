@@ -1,29 +1,32 @@
 import asyncio
 import json
 import logging
-from typing import Dict, Any, Optional
+from typing import Any
+
 import aiomqtt
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
 
 class MQTTClient:
     """
     Asynchronous MQTT client for connecting to a broker and handling messages.
     Parses incoming MQTT payloads as JSON and normalizes them.
     """
+
     def __init__(
         self,
         broker: str = "localhost",
         port: int = 1883,
         topic: str = "fall/detection",
-        username: Optional[str] = None,
-        password: Optional[str] = None,
+        username: str | None = None,
+        password: str | None = None,
         qos: int = 0,
         max_queue_size: int = 1000,
         max_retries: int = 10,
-        retry_delay: int = 5
+        retry_delay: int = 5,
     ):
         self.broker = broker
         self.port = port
@@ -48,11 +51,11 @@ class MQTTClient:
         logger.info(f"[MQTT] Topic: {self.topic}")
         logger.info(f"[MQTT] Username: {self.username}")
         logger.info(f"[MQTT] Password provided: {'Yes' if self.password else 'No'}")
-        
+
         while self._running and self._retry_count < self.max_retries:
             try:
                 logger.info(f"[MQTT] Connection attempt {self._retry_count + 1}/{self.max_retries}")
-                
+
                 async with aiomqtt.Client(
                     hostname=self.broker,
                     port=self.port,
@@ -61,18 +64,18 @@ class MQTTClient:
                 ) as client:
                     logger.info(f"[MQTT] ✅ Connected to {self.broker}:{self.port}")
                     self.connected_event.set()
-                    
+
                     await client.subscribe(self.topic, qos=self.qos)
                     logger.info(f"[MQTT] ✅ Subscribed to {self.topic} (QoS={self.qos})")
-                    
+
                     # Reset retry count on successful connection
                     self._retry_count = 0
-                    
+
                     async for message in client.messages:
                         if not self._running:
                             break
                         await self._process_message(message)
-            
+
             except aiomqtt.MqttError as e:
                 self.connected_event.clear()
                 self._retry_count += 1
@@ -88,11 +91,14 @@ class MQTTClient:
                 logger.info("[MQTT] 🛑 MQTT client task cancelled.")
                 self._running = False
                 break
-                
+
             except Exception as e:
                 self.connected_event.clear()
                 self._retry_count += 1
-                logger.error(f"[MQTT] ❌ Unexpected error (attempt {self._retry_count}/{self.max_retries}): {e}", exc_info=True)
+                logger.error(
+                    f"[MQTT] ❌ Unexpected error (attempt {self._retry_count}/{self.max_retries}): {e}",
+                    exc_info=True,
+                )
                 if self._retry_count < self.max_retries:
                     logger.info(f"[MQTT] ⏳ Retrying in {self.retry_delay}s...")
                     await asyncio.sleep(self.retry_delay)
@@ -112,30 +118,27 @@ class MQTTClient:
         try:
             raw_payload = message.payload.decode(errors="ignore")
             logger.info(f"[MQTT] 📨 Raw message on {message.topic}: {raw_payload}")
-            
+
             try:
                 data = json.loads(raw_payload)
                 normalized = self._normalize_data(data)
                 logger.info(f"[MQTT] ✅ Parsed and normalized: {normalized}")
-                
+
                 try:
-                    await asyncio.wait_for(
-                        self.message_queue.put(normalized),
-                        timeout=1.0
-                    )
-                    logger.info(f"[MQTT] 📥 Queued message successfully")
+                    await asyncio.wait_for(self.message_queue.put(normalized), timeout=1.0)
+                    logger.info("[MQTT] 📥 Queued message successfully")
                 except asyncio.TimeoutError:
                     logger.warning("[MQTT] ⚠️ Message queue full, dropping message.")
-                    
+
             except json.JSONDecodeError as e:
                 logger.warning(f"[MQTT] ⚠️ Invalid JSON payload: {raw_payload} - Error: {e}")
             except Exception as e:
                 logger.error(f"[MQTT] ❌ Error parsing/queuing message: {e}", exc_info=True)
-                
+
         except Exception as e:
             logger.error(f"[MQTT] ❌ Error processing message: {e}", exc_info=True)
 
-    def _normalize_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_data(self, data: dict[str, Any]) -> dict[str, Any]:
         """Normalize incoming data to standard format."""
         try:
             normalized = {
@@ -145,7 +148,7 @@ class MQTTClient:
                 "longitude": self._to_float(data.get("longitude")),
                 "has_gps_fix": self._to_bool(data.get("has_gps_fix", False)),
                 "timestamp": data.get("timestamp"),
-                "raw_data": data  # Keep original for debugging
+                "raw_data": data,  # Keep original for debugging
             }
             return normalized
         except Exception as e:
@@ -158,10 +161,10 @@ class MQTTClient:
                 "longitude": 0.0,
                 "has_gps_fix": False,
                 "timestamp": None,
-                "raw_data": data
+                "raw_data": data,
             }
 
-    async def get_message(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+    async def get_message(self, timeout: float | None = None) -> dict[str, Any]:
         """
         Retrieves a message from the internal queue.
         Waits for the client to be connected before trying to get a message.
@@ -169,7 +172,7 @@ class MQTTClient:
         logger.debug("[MQTT] 🔍 Waiting for connection before getting message...")
         await self.connected_event.wait()
         logger.debug("[MQTT] 🔍 Connection ready, getting message from queue...")
-        
+
         if timeout is not None:
             return await asyncio.wait_for(self.message_queue.get(), timeout=timeout)
         return await self.message_queue.get()

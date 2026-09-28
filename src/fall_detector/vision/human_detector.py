@@ -1,6 +1,4 @@
 # human_detector.py
-import cv2
-import numpy as np
 from ultralytics import YOLO
 
 
@@ -24,9 +22,9 @@ class HumanDetector:
         Returns:
             A list of detected person bounding boxes.
         """
-        results = self.model.predict(
-            frame, conf=self.conf_threshold, iou=self.iou_threshold, verbose=False
-        )[0]
+        results = self.model.predict(frame, conf=self.conf_threshold, iou=self.iou_threshold, verbose=False)[
+            0
+        ]
 
         if results.boxes is None or results.boxes.xyxy is None:
             return []

@@ -16,17 +16,16 @@ Usage:
 
 from __future__ import annotations
 
-import time
 import logging
 import socket
-from typing import Optional, Tuple, Union, List
+import time
 from urllib.parse import urlparse
 
-import requests
-import numpy as np
 import cv2
+import numpy as np
+import requests
 
-from config import config  # ✅ project-level configuration
+from fall_detector import settings as config  # ✅ project-level configuration
 
 # ---------------- Logger ----------------
 logger = logging.getLogger("esp32_stream")
@@ -37,8 +36,8 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 # ---------------- Constants ----------------
-JPEG_START = b'\xff\xd8'
-JPEG_END = b'\xff\xd9'
+JPEG_START = b"\xff\xd8"
+JPEG_END = b"\xff\xd9"
 
 
 # ---------------- Exceptions ----------------
@@ -86,10 +85,10 @@ class ESP32StreamWrapper:
         self._backoff_base = float(reconnect_backoff_base)
         self._backoff_max = float(reconnect_backoff_max)
 
-        self.session: Optional[requests.Session] = None
-        self.response: Optional[requests.Response] = None
+        self.session: requests.Session | None = None
+        self.response: requests.Response | None = None
         self._iter = None
-        self.bytes_buffer = b''
+        self.bytes_buffer = b""
         self.last_frame_time = 0.0
         self._connected_at = 0.0
         self._connect_attempts = 0
@@ -104,11 +103,13 @@ class ESP32StreamWrapper:
     # ---------------- Connection ----------------
     def _make_session(self) -> requests.Session:
         s = requests.Session()
-        s.headers.update({
-            "User-Agent": "esp32-mjpeg-client/1.1",
-            "Accept": "multipart/x-mixed-replace, image/jpeg, */*",
-            "Connection": "keep-alive",
-        })
+        s.headers.update(
+            {
+                "User-Agent": "esp32-mjpeg-client/1.1",
+                "Accept": "multipart/x-mixed-replace, image/jpeg, */*",
+                "Connection": "keep-alive",
+            }
+        )
         return s
 
     def connect(self) -> bool:
@@ -132,7 +133,7 @@ class ESP32StreamWrapper:
                 logger.warning(f"[ESP32] Unexpected Content-Type: {ctype}")
 
             self._iter = self.response.iter_content(chunk_size=self.read_chunk_size)
-            self.bytes_buffer = b''
+            self.bytes_buffer = b""
             self.last_frame_time = time.time()
             self._connected_at = time.time()
             self._connect_attempts = 0
@@ -145,22 +146,26 @@ class ESP32StreamWrapper:
 
     def release(self):
         if self.response:
-            try: self.response.close()
-            except Exception: pass
+            try:
+                self.response.close()
+            except Exception:
+                pass
         if self.session:
-            try: self.session.close()
-            except Exception: pass
+            try:
+                self.session.close()
+            except Exception:
+                pass
         self._iter = None
         self.response = None
         self.session = None
-        self.bytes_buffer = b''
+        self.bytes_buffer = b""
         logger.info(f"[ESP32] Stream released: {self.url}")
 
     # ---------------- Reading ----------------
     def is_alive(self) -> bool:
         return (time.time() - self.last_frame_time) < self.alive_timeout
 
-    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+    def read(self) -> tuple[bool, np.ndarray | None]:
         # Nâng cấp log từ debug lên info để dễ theo dõi sự kiện reconnect quan trọng
         if not self.is_alive():
             logger.info("[ESP32] Alive timeout expired; attempting reconnect.")
@@ -171,7 +176,7 @@ class ESP32StreamWrapper:
 
         try:
             chunk = next(self._iter, None)
-            
+
             # REFACTOR: Loại bỏ self.connect() khi không có chunk để tránh spam log.
             # Logic Alive Watchdog sẽ xử lý việc reconnect sau timeout (10s).
             if not chunk:
@@ -179,14 +184,14 @@ class ESP32StreamWrapper:
 
             self.bytes_buffer += chunk
             if len(self.bytes_buffer) > self.max_buffer:
-                self.bytes_buffer = b''
+                self.bytes_buffer = b""
                 logger.warning("[ESP32] Buffer overflow, resetting buffer.")
 
             start = self.bytes_buffer.find(JPEG_START)
             end = self.bytes_buffer.find(JPEG_END)
             if start != -1 and end != -1 and end > start:
-                jpg = self.bytes_buffer[start:end + 2]
-                self.bytes_buffer = self.bytes_buffer[end + 2:]
+                jpg = self.bytes_buffer[start : end + 2]
+                self.bytes_buffer = self.bytes_buffer[end + 2 :]
                 arr = np.frombuffer(jpg, np.uint8)
                 img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if img is not None:
@@ -207,19 +212,23 @@ class ESP32StreamWrapper:
 
 
 # ---------------- Helpers ----------------
-def get_config_sources() -> List[Union[str, int]]:
+def get_config_sources() -> list[str | int]:
     """Load video sources from config.py instead of .env."""
-    sources: List[Union[str, int]] = []
+    sources: list[str | int] = []
     stream = getattr(config, "VIDEO_STREAM_URL", None)
     webcam = getattr(config, "VIDEO_WEBCAM_INDEX", None)
-    if stream: sources.append(stream)
-    if webcam is not None: sources.append(int(webcam))
-    if not sources: sources.append(0)
+    if stream:
+        sources.append(stream)
+    if webcam is not None:
+        sources.append(int(webcam))
+    if not sources:
+        sources.append(0)
     return sources
 
 
-def find_and_connect_source(priority_sources: Optional[List[Union[str, int]]] = None
-) -> Optional[Union[ESP32StreamWrapper, cv2.VideoCapture]]:
+def find_and_connect_source(
+    priority_sources: list[str | int] | None = None,
+) -> ESP32StreamWrapper | cv2.VideoCapture | None:
     """
     Try all sources in priority order:
     - HTTP/mDNS URL → ESP32StreamWrapper
@@ -259,7 +268,7 @@ if __name__ == "__main__":
         ok, frame = cap.read() if hasattr(cap, "read") else (False, None)
         if not ok or frame is None:
             # REFACTOR: Tăng thời gian chờ lên 0.3s để tránh spam log và giảm tải CPU
-            time.sleep(0.3) 
+            time.sleep(0.3)
             continue
         cv2.imshow("ESP32 Stream", frame)
         if cv2.waitKey(1) & 0xFF == 27:
